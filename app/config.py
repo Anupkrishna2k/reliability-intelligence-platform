@@ -48,6 +48,14 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"
 
+    # Metrics
+    metrics_enabled: bool = True
+    metrics_path: str = "/metrics"
+    # Probes and scrapes are excluded from the general request metrics by
+    # default: they are called on a fixed timer regardless of user traffic and
+    # would otherwise dominate request counts and latency percentiles.
+    metrics_include_probes: bool = False
+
     # API behaviour
     api_prefix: str = "/api"
     default_page_size: int = 20
@@ -79,6 +87,14 @@ class Settings(BaseSettings):
         if not 1 <= value <= 65535:
             raise ValueError(f"port must be between 1 and 65535, got {value}")
         return value
+
+    @field_validator("metrics_path")
+    @classmethod
+    def _validate_metrics_path(cls, value: str) -> str:
+        path = value.strip()
+        if not path.startswith("/"):
+            raise ValueError(f"metrics_path must start with '/', got {value!r}")
+        return path
 
     @property
     def is_production(self) -> bool:

@@ -19,9 +19,10 @@ from app.errors import (
     validation_exception_handler,
 )
 from app.logging_config import configure_logging, get_logger
+from app.metrics import Metrics, RouteTemplateResolver
 from app.middleware import RequestContextMiddleware
 from app.repository import OrderRepository
-from app.routers import health, orders
+from app.routers import health, metrics, orders
 
 _UTC = timezone.utc
 
@@ -33,6 +34,7 @@ the Reliability Intelligence Platform.
 * `GET /ready` - readiness probe, returns 503 when a dependency check fails
 * `GET {api_prefix}/orders` - paginated, filterable order list
 * `GET {api_prefix}/orders/{{order_id}}` - full order detail
+* `GET /metrics` - Prometheus metrics for scraping
 """
 
 
@@ -75,19 +77,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     application.state.settings = settings
+    application.state.metrics = Metrics(settings)
 
-    application.add_middleware(RequestContextMiddleware)
+    application.include_router(health.router)
+    application.include_router(orders.router, prefix=settings.api_prefix)
+
+    # Route templates come from the documented API surface, so metrics always
+    # agree with the OpenAPI schema and carry no per-request path values.
+    route_resolver = RouteTemplateResolver(application.openapi()["paths"].keys())
+    application.add_middleware(
+        RequestContextMiddleware, settings=settings, route_resolver=route_resolver
+    )
+
     application.add_exception_handler(OrderNotFoundError, order_not_found_handler)
     application.add_exception_handler(StarletteHTTPException, http_exception_handler)
     application.add_exception_handler(RequestValidationError, validation_exception_handler)
     application.add_exception_handler(Exception, unhandled_exception_handler)
 
-    application.include_router(health.router)
-    application.include_router(orders.router, prefix=settings.api_prefix)
+    if settings.metrics_enabled:
+        application.include_router(metrics.build_router(settings.metrics_path))
+    else:
+        logger.info("metrics_disabled")
 
     logger.info(
         "application_configured",
-        extra={"environment": settings.environment, "log_format": settings.log_format},
+        extra={
+            "environment": settings.environment,
+            "log_format": settings.log_format,
+            "metrics_enabled": settings.metrics_enabled,
+        },
     )
 
     return application

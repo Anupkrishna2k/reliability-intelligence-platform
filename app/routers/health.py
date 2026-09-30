@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Request, Response, status
 
+from app.metrics import Metrics
 from app.models import HealthResponse, ReadinessCheck, ReadinessResponse
 from app.repository import OrderRepository
 
@@ -72,6 +73,13 @@ async def ready(request: Request, response: Response) -> ReadinessResponse:
     all_passed = all(check.status == "pass" for check in checks)
     if not all_passed:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    # /ready is excluded from the general request metrics because probes run on
+    # a fixed timer, but its outcome is the single most important reliability
+    # signal, so it is published as its own one-series gauge.
+    metrics: Metrics | None = getattr(request.app.state, "metrics", None)
+    if metrics is not None:
+        metrics.set_ready(all_passed)
 
     return ReadinessResponse(
         status="ready" if all_passed else "not_ready",
