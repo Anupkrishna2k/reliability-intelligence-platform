@@ -1,0 +1,42 @@
+# Keep the build context small and never ship local state into the image.
+
+# Version control and CI
+.git
+.gitignore
+.github
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv
+venv
+env
+
+# Byte-compiled / cache
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Tests and coverage output
+tests
+requirements-dev.txt
+pytest.ini
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Docs and editor/OS noise
+README.md
+.idea
+.vscode
+.DS_Store
