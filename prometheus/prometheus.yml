@@ -1,0 +1,32 @@
+# Prometheus configuration for the local Reliability Intelligence stack.
+#
+# Prometheus runs as a container on the same Docker Compose network as the
+# API, so it resolves the service name `reliability-api` directly. Writing
+# localhost here would target the Prometheus container itself.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+  # Attached to every series this server collects, so queries and alerts can
+  # later filter by stack.
+  external_labels:
+    stack: reliability-intelligence-local
+
+scrape_configs:
+  # The Orders API. One static target: the compose service name and its
+  # internal port. Prometheus pulls http://reliability-api:8000/metrics on a
+  # timer; the API never pushes anything.
+  - job_name: reliability-api
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets:
+          - reliability-api:8000
+        labels:
+          service: reliability-api
+          # Deliberately not called `environment`: the API already exports an
+          # `environment` label on orders_api_build_info, and a target label
+          # with the same name would be renamed exported_environment.
+          env: local

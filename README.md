@@ -4,8 +4,9 @@ An SRE/DevOps portfolio project. This repository is built in stages; the goal
 is to grow a small but realistic service into a fully instrumented, observable,
 and safely deployed system.
 
-**Current stage: the Orders API** — the workload that later stages will
-instrument, observe, alert on, and deploy.
+**Current stage: local observability** — the Orders API runs as a Docker
+Compose stack next to a Prometheus server that scrapes it. Grafana, alerting,
+and deployment stages come later.
 
 ## What this service is
 
@@ -104,6 +105,118 @@ docker run --rm -p 8000:8000 \
   -e ORDERS_API_LOG_LEVEL=DEBUG \
   orders-api:0.1.0
 ```
+
+## Running the complete stack with Docker Compose
+
+`docker-compose.yml` runs the whole local stack: the Orders API and a
+Prometheus server that scrapes it.
+
+| Service           | Image                        | Host access                    |
+| ----------------- | ---------------------------- | ------------------------------ |
+| `reliability-api` | built from `Dockerfile`      | http://localhost:8000          |
+| `prometheus`      | `prom/prometheus:v3.5.0`     | http://localhost:9090          |
+
+Start it:
+
+```bash
+docker compose up --build -d
+```
+
+Verify both services are up:
+
+```bash
+docker compose ps
+curl -s http://localhost:8000/health      # API liveness
+curl -s http://localhost:9090/-/ready     # Prometheus readiness
+```
+
+Stop it:
+
+```bash
+docker compose down        # stop containers, keep collected metrics
+docker compose down -v     # also delete the metrics volume
+```
+
+Prometheus only starts after the API reports healthy (`depends_on` with
+`condition: service_healthy`), so a fresh `up` is immediately scrapeable.
+
+### Accessing the Orders API
+
+- **Base URL:** http://localhost:8000
+- **Interactive docs:** http://localhost:8000/docs
+- **OpenAPI schema:** http://localhost:8000/openapi.json
+- **Metrics:** http://localhost:8000/metrics
+
+```bash
+curl -s "http://localhost:8000/api/orders?limit=2"
+curl -s http://localhost:8000/api/orders/ORD-2026-0001
+```
+
+### Accessing Prometheus
+
+- **UI:** http://localhost:9090
+- **Target health:** http://localhost:9090/targets
+- **Graphs:** http://localhost:9090/graph (try `up` or `orders_api_build_info`)
+- **Readiness probe:** http://localhost:9090/-/ready
+
+From the terminal:
+
+```bash
+# Is the Orders API target up?
+curl -s 'http://localhost:9090/api/v1/query?query=up{job="reliability-api"}'
+
+# Full target list, including the scrape URL and last error if any
+curl -s http://localhost:9090/api/v1/targets | python3 -m json.tool
+```
+
+A healthy target reports `"health": "up"` and
+`"scrapeUrl": "http://reliability-api:8000/metrics"`.
+
+### How Prometheus discovers and scrapes the API
+
+There is no agent and no push: Prometheus **pulls**.
+
+1. Compose creates a single network and attaches both services to it. On that
+   network, the service name is also a DNS name, so Prometheus resolves
+   `reliability-api` to the API container's IP. That is why the target is
+   `reliability-api:8000` and **not** `localhost:8000` — inside the Prometheus
+   container, `localhost` is the Prometheus container itself.
+2. `prometheus/prometheus.yml` declares a `static_configs` scrape job named
+   `reliability-api` pointing at `reliability-api:8000` with
+   `metrics_path: /metrics`.
+3. Every 15 seconds Prometheus issues an HTTP GET to
+   `http://reliability-api:8000/metrics`, parses the Prometheus text
+   exposition format, and appends the samples to its local TSDB (a Docker
+   named volume).
+4. Each scrape produces the synthetic `up` series — `1` for a successful
+   scrape, `0` for a failed one — which is the standard way to alert on
+   "Prometheus cannot reach the target". Target labels (`job`, `service`,
+   `env`, `instance`) are attached to every series scraped from that target.
+5. The config file is bind-mounted read-only, so editing
+   `prometheus/prometheus.yml` and running `docker compose restart prometheus`
+   applies changes without rebuilding anything.
+
+### Troubleshooting the stack
+
+```bash
+docker compose ps                                     # are both containers healthy?
+docker compose logs -f reliability-api                # API logs (JSON, one line per request)
+docker compose logs -f prometheus                      # scrape and config errors
+curl -s http://localhost:9090/api/v1/targets           # target health + last scrape error
+curl -s http://localhost:8000/metrics | head           # is the API exposing metrics at all?
+docker compose config -q                               # validate the compose file
+docker compose restart prometheus                      # reload prometheus.yml after editing it
+docker compose down -v && docker compose up --build -d # clean slate
+```
+
+Typical failures:
+
+| Symptom | Cause |
+| ------- | ----- |
+| Target `down`, error `connection refused` | The API container is not running — check its logs. |
+| Target `down`, error `no such host` | The target is not using the service name `reliability-api`. |
+| Prometheus `error loading config` | A YAML syntax error in `prometheus/prometheus.yml` — visible in `docker compose logs prometheus`. |
+| Port already in use on start | Something else holds `8000` or `9090`; stop it or change the host side of the `ports` mapping. |
 
 ## Configuration
 
@@ -338,7 +451,8 @@ orders_api_ready 1.0
 orders_api_build_info{environment="production",version="1.0.0"} 1.0
 ```
 
-Useful queries once a Prometheus server exists:
+Queries to run in the Prometheus UI at http://localhost:9090/graph once the
+stack is up:
 
 ```promql
 # Error ratio on the order detail endpoint
@@ -398,6 +512,9 @@ which removes the `/metrics` route and stops all recording.
 ## Project layout
 
 ```
+docker-compose.yml     local stack: reliability-api + prometheus
+prometheus/
+  prometheus.yml       scrape job for the Orders API
 app/
   main.py            application factory, lifespan, exception handlers
   config.py          environment-driven settings
@@ -418,10 +535,9 @@ tests/               pytest suite
 
 ## Not in this stage
 
-Deliberately deferred to later stages: the Prometheus server and `prometheus.yml`,
-Grafana, Alertmanager, Kubernetes, Terraform, AWS, CI/CD, a database, and
-authentication.
+Deliberately deferred to later stages: Grafana, Alertmanager, Kubernetes,
+Terraform, AWS, CI/CD, a database, and authentication.
 
-This milestone only instruments the application. There is nothing here that
-*collects* or *stores* the metrics yet, so the numbers reset every time the
-process restarts and are not visible outside the container.
+Prometheus collects and stores the metrics locally, but there is no dashboard
+or alerting on top of it yet — the numbers are visible in the Prometheus UI,
+and they reset when the metrics volume is deleted.

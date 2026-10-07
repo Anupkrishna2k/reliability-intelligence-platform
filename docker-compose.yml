@@ -1,0 +1,55 @@
+# Local development stack: Orders API + Prometheus.
+#
+# Compose puts both services on one user-defined network where the service
+# name is also the DNS name. Prometheus therefore reaches the API at
+# http://reliability-api:8000/metrics; "localhost" inside the Prometheus
+# container would mean the Prometheus container itself and never reach the API.
+
+services:
+  reliability-api:
+    build: .
+    image: reliability-api:1.0.0
+    ports:
+      - "8000:8000"
+    # The image already ships a HEALTHCHECK; this tightens the interval so the
+    # health gate below opens in seconds rather than half a minute.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    depends_on:
+      reliability-api:
+        condition: service_healthy
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    # /-/ready answers 200 once Prometheus has finished starting and loaded
+    # its config; /-/healthy only says the process is up.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
