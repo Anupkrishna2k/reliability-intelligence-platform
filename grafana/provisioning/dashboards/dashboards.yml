@@ -1,0 +1,23 @@
+# Grafana dashboard provisioning for the local Reliability Intelligence stack.
+#
+# Dashboards are loaded from JSON files in this repository, so they are
+# versioned on GitHub and recreated automatically on every start. The UI cannot
+# overwrite them: edits made in the browser are discarded in favour of the
+# committed file, which keeps the repository as the single source of truth.
+
+apiVersion: 1
+
+providers:
+  - name: Reliability Intelligence
+    orgId: 1
+    folder: ""
+    folderUid: ""
+    type: file
+    disableDeletion: true
+    # Only re-read the JSON when it changes on disk; restarting the container
+    # always picks up edits immediately.
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

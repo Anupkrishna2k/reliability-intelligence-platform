@@ -36,6 +36,7 @@ Dockerfile
 .dockerignore
 docker-compose.yml
 prometheus
+grafana
 
 # Docs and editor/OS noise
 README.md

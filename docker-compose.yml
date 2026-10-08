@@ -1,9 +1,10 @@
-# Local development stack: Orders API + Prometheus.
+# Local development stack: Orders API + Prometheus + Grafana.
 #
-# Compose puts both services on one user-defined network where the service
+# Compose puts all services on one user-defined network where the service
 # name is also the DNS name. Prometheus therefore reaches the API at
-# http://reliability-api:8000/metrics; "localhost" inside the Prometheus
-# container would mean the Prometheus container itself and never reach the API.
+# http://reliability-api:8000/metrics and Grafana reaches Prometheus at
+# http://prometheus:9090; "localhost" inside either container would mean that
+# container itself and never reach the others.
 
 services:
   reliability-api:
@@ -12,14 +13,17 @@ services:
     ports:
       - "8000:8000"
     # The image already ships a HEALTHCHECK; this tightens the interval so the
-    # health gate below opens in seconds rather than half a minute.
+    # health gate below opens in seconds rather than half a minute. It probes
+    # /health (liveness) and /ready (readiness): the second call is what keeps
+    # the `orders_api_ready` gauge current, which backs the Grafana readiness
+    # panel without anyone having to hit /ready by hand.
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)",
+          "import sys, urllib.request as u; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 and u.urlopen('http://127.0.0.1:8000/ready', timeout=2).status == 200 else 1)",
         ]
       interval: 5s
       timeout: 3s
@@ -51,5 +55,41 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  grafana:
+    image: grafana/grafana:11.6.0
+    # Grafana waits for a ready Prometheus so its datasource is queryable the
+    # first time the UI is opened.
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      # Local development credentials only - never ship these defaults to a
+      # shared or internet-reachable environment.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Keep a demo stack quiet: no usage reporting and no update phone-home.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      # Datasource and dashboard provisioning, loaded from this repository on
+      # every start - no manual "Add datasource" click-through.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      # Persists Grafana's own state (users, preferences, Grafana DB) across
+      # restarts. Dashboards themselves are re-provisioned from git, so
+      # `down -v` loses nothing that is not committed.
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
 volumes:
   prometheus-data:
+  grafana-data:

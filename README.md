@@ -5,8 +5,8 @@ is to grow a small but realistic service into a fully instrumented, observable,
 and safely deployed system.
 
 **Current stage: local observability** — the Orders API runs as a Docker
-Compose stack next to a Prometheus server that scrapes it. Grafana, alerting,
-and deployment stages come later.
+Compose stack next to a Prometheus server that scrapes it, with a provisioned
+Grafana dashboard on top. Alerting and deployment stages come later.
 
 ## What this service is
 
@@ -108,13 +108,14 @@ docker run --rm -p 8000:8000 \
 
 ## Running the complete stack with Docker Compose
 
-`docker-compose.yml` runs the whole local stack: the Orders API and a
-Prometheus server that scrapes it.
+`docker-compose.yml` runs the whole local stack: the Orders API, a Prometheus
+server that scrapes it, and a Grafana dashboard on top of that data.
 
 | Service           | Image                        | Host access                    |
 | ----------------- | ---------------------------- | ------------------------------ |
 | `reliability-api` | built from `Dockerfile`      | http://localhost:8000          |
 | `prometheus`      | `prom/prometheus:v3.5.0`     | http://localhost:9090          |
+| `grafana`         | `grafana/grafana:11.6.0`     | http://localhost:3000          |
 
 Start it:
 
@@ -122,23 +123,112 @@ Start it:
 docker compose up --build -d
 ```
 
-Verify both services are up:
+Verify all three services are up:
 
 ```bash
 docker compose ps
 curl -s http://localhost:8000/health      # API liveness
 curl -s http://localhost:9090/-/ready     # Prometheus readiness
+curl -s http://localhost:3000/api/health  # Grafana health
 ```
 
 Stop it:
 
 ```bash
-docker compose down        # stop containers, keep collected metrics
-docker compose down -v     # also delete the metrics volume
+docker compose down        # stop containers, keep collected metrics/dashboards
+docker compose down -v     # also delete the prometheus and grafana volumes
 ```
 
-Prometheus only starts after the API reports healthy (`depends_on` with
-`condition: service_healthy`), so a fresh `up` is immediately scrapeable.
+Prometheus only starts after the API reports healthy, and Grafana only starts
+after Prometheus reports ready (`depends_on` with `condition: service_healthy`),
+so on a fresh `up` the first thing visible in Grafana is already queryable.
+
+## Grafana dashboards
+
+Grafana is exposed at **http://localhost:3000**.
+
+- **Login:** user `admin`, password `admin`
+  (**local development only** — change `GF_SECURITY_ADMIN_PASSWORD` in
+  `docker-compose.yml` before exposing this stack anywhere else).
+- **Sign-up is disabled**, so no one can create an account on your machine.
+
+### Opening the dashboard
+
+1. Go to http://localhost:3000 and log in with `admin` / `admin`.
+2. **Dashboards** → **Orders API – Service Overview** (it is provisioned into
+   the root folder on every start).
+
+The dashboard is committed to the repository and recreated automatically on
+start-up from `grafana/dashboards/orders-api-overview.json`. There is nothing
+to click through after a fresh `docker compose up` — the datasource and the
+dashboard both come from provisioning files, so the whole setup is reproducible
+from git.
+
+### What is on it
+
+| Panel                       | What it shows (query)                                              |
+| --------------------------- | ------------------------------------------------------------------ |
+| API Readiness               | `orders_api_ready` gauge — 1 while `/ready` passes.                |
+| HTTP Request Rate           | `sum(rate(orders_api_http_requests_total[5m]))`.                   |
+| Error Rate (4xx + 5xx)      | `4xx|5xx` requests / total requests over 5m.                       |
+| P95 Request Latency         | `histogram_quantile(0.95, ...)` of HTTP latency.                   |
+| HTTP Requests by Status     | Request rate split by `status_code` label.                         |
+| Request Latency Percentiles | p50 / p95 / p99 from the HTTP duration histogram.                  |
+| Order Lookups: Success/NF   | `orders_api_order_lookups_total` by `outcome`.                     |
+| Request Rate by Route       | Rate per route template (low-cardinality by design).               |
+| Application / Build Info    | `orders_api_build_info` version + environment labels.              |
+| Prometheus Scrape Target    | `up{job="reliability-api"}` — is the metrics pipeline alive?       |
+
+Only metrics the application already exposes are used — nothing was invented
+for the dashboard.
+
+### Generating demo traffic
+
+The request-rate panels read counter deltas, so a single burst of calls shows
+up as little more than a spike. To make the dashboard look alive, generate
+sustained load for a minute or two:
+
+```bash
+# ~3 requests/sec including intentional 404s and a validation error
+for s in $(seq 1 120); do
+  curl -s -o /dev/null "http://localhost:8000/api/orders"
+  curl -s -o /dev/null "http://localhost:8000/api/orders/ORD-2026-000$((s % 6 + 1))"
+  curl -s -o /dev/null "http://localhost:8000/api/orders/ORD-NOPE-$s"
+  [ $((s % 10)) -eq 0 ] && curl -s -o /dev/null "http://localhost:8000/api/orders?status=not-a-status"
+  sleep 0.3
+done
+```
+
+The `not found` lookups and the `422` show up as healthy red lines — they are
+expected traffic, not a broken service.
+
+### How Grafana connects to Prometheus
+
+Exactly like Prometheus connects to the API: no agent, no push, just the
+Compose network.
+
+1. `grafana/provisioning/datasources/datasource.yml` declares one Prometheus
+   datasource pointing at `http://prometheus:9090` — the Compose service name,
+   never `localhost`, because inside the Grafana container `localhost` is
+   Grafana itself. It is pinned to `uid: prometheus` so the committed dashboard
+   JSON always resolves to it, and `editable: false` keeps it managed.
+2. `grafana/provisioning/dashboards/dashboards.yml` registers the
+   `grafana/dashboards/` directory as a **file provider**. Every dashboard JSON
+   there is loaded at start-up; edits in the browser are discarded in favour of
+   the committed file.
+3. The Grafana container mounts both directories read-only, so the running
+   config is never modified in place — change the files here and run
+   `docker compose restart grafana` to apply.
+
+### Grafana troubleshooting
+
+| Symptom | Cause |
+| ------- | ----- |
+| `admin` login rejected | The volume from an old, differently-configured run; `docker compose down -v` and `up -d`. |
+| Datasource listed but "No data" in every panel | No traffic scraped yet in the selected time range; generate demo traffic (above) and refresh. |
+| Dashboard missing after edits | The provider reads files on start and re-checks every 30s; `docker compose restart grafana` applies changes. |
+| `proxy: Request failed` on the datasource | Grafana cannot reach `http://prometheus:9090`; check `docker compose logs grafana`. |
+| Port 3000 already in use | Something else holds the port; stop it or remap `"3000:3000"` in `docker-compose.yml`. |
 
 ### Accessing the Orders API
 
@@ -452,7 +542,8 @@ orders_api_build_info{environment="production",version="1.0.0"} 1.0
 ```
 
 Queries to run in the Prometheus UI at http://localhost:9090/graph once the
-stack is up:
+stack is up (the Grafana dashboard at http://localhost:3000 renders exactly
+these — see [Grafana dashboards](#grafana-dashboards) for a ready-made view):
 
 ```promql
 # Error ratio on the order detail endpoint
@@ -512,9 +603,16 @@ which removes the `/metrics` route and stops all recording.
 ## Project layout
 
 ```
-docker-compose.yml     local stack: reliability-api + prometheus
+docker-compose.yml     local stack: reliability-api + prometheus + grafana
 prometheus/
   prometheus.yml       scrape job for the Orders API
+grafana/
+  provisioning/
+    datasources/       Prometheus datasource provisioning (auto-created at start)
+    dashboards/        dashboard provider config (filesystem-backed)
+  dashboards/
+    orders-api-overview.json
+                       versioned dashboard JSON, loaded on every start
 app/
   main.py            application factory, lifespan, exception handlers
   config.py          environment-driven settings
@@ -535,9 +633,10 @@ tests/               pytest suite
 
 ## Not in this stage
 
-Deliberately deferred to later stages: Grafana, Alertmanager, Kubernetes,
-Terraform, AWS, CI/CD, a database, and authentication.
+Deliberately deferred to later stages: Alertmanager, Kubernetes, Terraform,
+AWS, CI/CD, a database, and authentication.
 
-Prometheus collects and stores the metrics locally, but there is no dashboard
-or alerting on top of it yet — the numbers are visible in the Prometheus UI,
-and they reset when the metrics volume is deleted.
+Prometheus collects and stores the metrics locally and Grafana visualises
+them, but nothing alerts on top of that data yet — that is the next milestone.
+The dashboard is provisioned from git, so the whole stack can be recreated on a
+fresh machine with a single `docker compose up`.

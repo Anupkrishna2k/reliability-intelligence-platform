@@ -1,0 +1,25 @@
+# Grafana datasource provisioning for the local Reliability Intelligence stack.
+#
+# Provisioned file-based, so a fresh `docker compose up` always gets the
+# Prometheus datasource without anyone clicking through the UI. The `uid` is
+# pinned so the committed dashboard JSON can reference this datasource
+# unambiguously.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    # `proxy` makes Grafana's backend call Prometheus; the browser never needs
+    # to reach the Compose network, and no CORS is involved.
+    access: proxy
+    # Service name on the Compose network - never "localhost", which inside
+    # the Grafana container would mean the Grafana container itself.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Used by Grafana for `$__rate_interval` calculations; matches the
+      # scrape_interval declared in prometheus/prometheus.yml.
+      timeInterval: 15s
