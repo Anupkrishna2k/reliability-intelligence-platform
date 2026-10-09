@@ -8,6 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
+from app.config import MAX_FAILURE_LATENCY_MS, MAX_FAILURE_RATE_PERCENT
+
 # --- pricing rules -----------------------------------------------------------
 # Kept as module constants so the API can describe one consistent money model
 # without reaching into configuration or a database.
@@ -186,6 +188,44 @@ class ReadinessResponse(BaseModel):
     environment: str
     checks: list[ReadinessCheck]
     timestamp: datetime
+
+
+class FailureConfig(BaseModel):
+    """Active failure-injection scenario, as returned by the control API."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(description="Whether the scenario is currently active.")
+    latency_ms: int = Field(
+        ge=0,
+        le=MAX_FAILURE_LATENCY_MS,
+        description="Artificial delay added to each request, in milliseconds.",
+    )
+    failure_rate_percent: float = Field(
+        ge=0,
+        le=MAX_FAILURE_RATE_PERCENT,
+        description="Probability that a request is answered with HTTP 500, in percent.",
+    )
+
+
+class FailureConfigUpdate(BaseModel):
+    """Request body for configuring the failure-injection scenario."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True, description="Turn the scenario on or off.")
+    latency_ms: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_FAILURE_LATENCY_MS,
+        description="Artificial delay added to each request, in milliseconds.",
+    )
+    failure_rate_percent: float = Field(
+        default=0.0,
+        ge=0,
+        le=MAX_FAILURE_RATE_PERCENT,
+        description="Probability that a request is answered with HTTP 500, in percent.",
+    )
 
 
 class ErrorBody(BaseModel):

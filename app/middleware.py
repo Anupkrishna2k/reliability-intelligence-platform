@@ -8,14 +8,18 @@ visible to both the access log and anything logged inside the request handler.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Awaitable, Callable, MutableMapping, cast
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from app.config import Settings
+from app.failure_injection import FailureInjector
 from app.logging_config import (
     get_logger,
+    get_request_id,
     new_request_id,
     reset_request_id,
     set_request_id,
@@ -49,6 +53,10 @@ class RequestContextMiddleware:
         self.route_resolver = route_resolver
         self.logger = get_logger("app.access")
         self._excluded = {*PROBE_PATHS, settings.metrics_path}
+        if settings.failure_injection_enabled:
+            # The failure-injection control plane is operational tooling, not
+            # application traffic, so it is excluded just like the metrics path.
+            self._excluded.add(settings.failure_injection_path)
 
     def _should_record(self, path: str) -> bool:
         """Decide whether this path counts as application traffic."""
@@ -124,3 +132,72 @@ class RequestContextMiddleware:
         if not client:
             return "-"
         return str(client[0])
+
+
+class FailureInjectionMiddleware:
+    """Apply a configured artificial delay and/or HTTP 500 to each request.
+
+    This sits *inside* :class:`RequestContextMiddleware`, so an injected delay
+    or failure is observed by the existing access log and HTTP metrics exactly
+    like a real slow request or server error would be — no separate counters.
+
+    Probes, the metrics scrape and the control API itself are exempt, so the
+    instance stays observable and the injection can always be turned back off.
+    """
+
+    def __init__(
+        self,
+        app: Callable[..., Awaitable[None]],
+        *,
+        settings: Settings,
+        injector: FailureInjector,
+    ) -> None:
+        self.app = app
+        self.injector = injector
+        self.logger = get_logger("app.failure_injection")
+        self._exempt = {
+            *PROBE_PATHS,
+            settings.metrics_path,
+            settings.failure_injection_path,
+        }
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not self.injector.feature_enabled:
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "/")
+        if path in self._exempt:
+            await self.app(scope, receive, send)
+            return
+
+        delay_seconds = self.injector.delay_seconds()
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+
+        if self.injector.should_fail():
+            scenario = self.injector.snapshot()
+            self.logger.warning(
+                "injected_failure",
+                extra={
+                    "http_method": scope.get("method", "-"),
+                    "http_path": path,
+                    "http_status": 500,
+                    "failure_rate_percent": scenario.failure_rate_percent,
+                },
+            )
+            response = JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": "injected_failure",
+                        "message": "Simulated internal server error "
+                        "(controlled failure injection).",
+                    },
+                    "request_id": get_request_id(),
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)

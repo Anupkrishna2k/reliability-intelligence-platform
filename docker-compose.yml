@@ -12,6 +12,15 @@ services:
     image: reliability-api:1.0.0
     ports:
       - "8000:8000"
+    environment:
+      # This stack is a local demo, so controlled failure injection is
+      # explicitly enabled and the environment is marked as development. The
+      # service refuses to enable failure injection in a production
+      # environment, so a real deployment cannot expose the control API by
+      # accident. Leave the image default (production, disabled) for anything
+      # other than this local stack.
+      ORDERS_API_ENVIRONMENT: development
+      ORDERS_API_FAILURE_INJECTION_ENABLED: "true"
     # The image already ships a HEALTHCHECK; this tightens the interval so the
     # health gate below opens in seconds rather than half a minute. It probes
     # /health (liveness) and /ready (readiness): the second call is what keeps

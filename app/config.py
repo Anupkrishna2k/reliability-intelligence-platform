@@ -14,13 +14,19 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 VALID_LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
 VALID_LOG_FORMATS = {"json", "text"}
+
+#: Upper bounds enforced on failure-injection controls. They keep a demo from
+#: accidentally pinning every worker on an absurd delay or a value that is
+#: meaningless as a probability.
+MAX_FAILURE_LATENCY_MS = 10_000
+MAX_FAILURE_RATE_PERCENT = 100.0
 
 
 class Settings(BaseSettings):
@@ -55,6 +61,12 @@ class Settings(BaseSettings):
     # default: they are called on a fixed timer regardless of user traffic and
     # would otherwise dominate request counts and latency percentiles.
     metrics_include_probes: bool = False
+
+    # Failure injection (local development / demo only). Disabled by default,
+    # and refused outright in a production environment: the control API and the
+    # injected latency/500s must never be reachable on a real deployment.
+    failure_injection_enabled: bool = False
+    failure_injection_path: str = "/admin/failure"
 
     # API behaviour
     api_prefix: str = "/api"
@@ -95,6 +107,31 @@ class Settings(BaseSettings):
         if not path.startswith("/"):
             raise ValueError(f"metrics_path must start with '/', got {value!r}")
         return path
+
+    @field_validator("failure_injection_path")
+    @classmethod
+    def _validate_failure_injection_path(cls, value: str) -> str:
+        path = value.strip()
+        if not path.startswith("/"):
+            raise ValueError(f"failure_injection_path must start with '/', got {value!r}")
+        if path == "/":
+            raise ValueError("failure_injection_path must not be the site root")
+        return path
+
+    @model_validator(mode="after")
+    def _guard_failure_injection(self) -> "Settings":
+        """Refuse to enable failure injection in a production environment.
+
+        This is the hard safety guard behind the default-off feature flag: even
+        an explicit ``ORDERS_API_FAILURE_INJECTION_ENABLED=true`` cannot expose
+        the control plane on a production deployment.
+        """
+        if self.failure_injection_enabled and self.is_production:
+            raise ValueError(
+                "failure_injection_enabled must not be set in a production "
+                f"environment (environment={self.environment!r})"
+            )
+        return self
 
     @property
     def is_production(self) -> bool:

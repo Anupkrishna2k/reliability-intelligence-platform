@@ -6,7 +6,11 @@ and safely deployed system.
 
 **Current stage: local observability** — the Orders API runs as a Docker
 Compose stack next to a Prometheus server that scrapes it, with a provisioned
-Grafana dashboard on top. Alerting and deployment stages come later.
+Grafana dashboard on top. This stage adds **controlled failure injection**: a
+flag-gated control API that adds artificial latency and HTTP 500s on demand, so
+the existing metrics and dashboard can be shown reacting to a realistic
+incident. It is disabled by default and refused in production. Alerting and
+deployment stages come later.
 
 ## What this service is
 
@@ -29,10 +33,15 @@ be swapped in later without touching the HTTP layer.
 | `GET`  | `/api/orders`           | Paginated, filterable order list, newest first.                |
 | `GET`  | `/api/orders/{order_id}`| Full order detail including line items and money totals.       |
 | `GET`  | `/metrics`              | Prometheus metrics, for scraping.                             |
+| `GET`  | `/admin/failure`        | Read failure-injection scenario. Only when enabled (see below). |
+| `PUT`  | `/admin/failure`        | Configure latency and/or HTTP 500 rate. Only when enabled.    |
+| `DELETE`| `/admin/failure`       | Reset failure injection to normal. Only when enabled.         |
 
 Interactive API docs are served at `/docs`, and the OpenAPI schema at
 `/openapi.json`. `/metrics` is intentionally hidden from the docs — it exists
-for Prometheus, not for API consumers.
+for Prometheus, not for API consumers. The `/admin/failure` routes only exist
+when failure injection is explicitly enabled; see
+[Controlled failure injection](#controlled-failure-injection-local-demos-only).
 
 #### Why liveness and readiness are separate
 
@@ -308,6 +317,135 @@ Typical failures:
 | Prometheus `error loading config` | A YAML syntax error in `prometheus/prometheus.yml` — visible in `docker compose logs prometheus`. |
 | Port already in use on start | Something else holds `8000` or `9090`; stop it or change the host side of the `ports` mapping. |
 
+## Controlled failure injection (local demos only)
+
+The API can simulate production-like incidents on demand: add artificial
+latency, return HTTP 500s at a configurable rate, or both. That lets you show
+the Prometheus metrics and Grafana dashboard reacting to a realistic problem
+without actually breaking anything.
+
+### Safety
+
+Failure injection is **disabled by default** and **local-development only**:
+
+- The whole feature is gated behind `ORDERS_API_FAILURE_INJECTION_ENABLED`,
+  which defaults to `false`. When it is off, the control endpoints do not exist
+  (they return `404`) and every request is served exactly as it was before.
+- The service **refuses to start** if failure injection is enabled while
+  `ORDERS_API_ENVIRONMENT` is `production`/`prod`, so a single environment
+  variable cannot expose the control plane on a real deployment.
+- Injected behaviour is hard-capped: latency `0–10000 ms` and failure rate
+  `0–100 %`. Anything outside that range is rejected with `422`.
+- Liveness (`/health`), readiness (`/ready`), the metrics scrape (`/metrics`)
+  and the control API itself are always exempt, so the instance stays
+  observable and injection can always be switched back off.
+
+The local Docker Compose stack sets `ORDERS_API_ENVIRONMENT=development` and
+`ORDERS_API_FAILURE_INJECTION_ENABLED=true` for exactly this reason. A plain
+`docker run` of the image keeps its production default and stays safe.
+
+### Enabling it locally
+
+The Compose stack already enables it. For a local `python run.py` session:
+
+```bash
+ORDERS_API_FAILURE_INJECTION_ENABLED=true python run.py
+```
+
+or set the same variable in `.env`. The control API is then mounted at
+`/admin/failure` (configurable with `ORDERS_API_FAILURE_INJECTION_PATH`).
+
+### Control API
+
+| Method   | Path              | Effect                                                |
+| -------- | ----------------- | ----------------------------------------------------- |
+| `GET`    | `/admin/failure`  | Read the active scenario.                             |
+| `PUT`    | `/admin/failure`  | Set `enabled`, `latency_ms`, `failure_rate_percent`.  |
+| `DELETE` | `/admin/failure`  | Reset: disabled, zero latency, zero failures.         |
+
+`enabled` defaults to `true`, so a `PUT` that only sets `latency_ms` or
+`failure_rate_percent` activates the scenario immediately. `DELETE` is the
+one-call reset.
+
+```bash
+# Current scenario
+curl -s http://localhost:8000/admin/failure
+
+# Add 500 ms of latency to every application request
+curl -s -X PUT http://localhost:8000/admin/failure \
+  -H 'content-type: application/json' \
+  -d '{"enabled": true, "latency_ms": 500, "failure_rate_percent": 0}'
+
+# Fail 30% of requests with HTTP 500 (and keep the latency)
+curl -s -X PUT http://localhost:8000/admin/failure \
+  -H 'content-type: application/json' \
+  -d '{"enabled": true, "latency_ms": 500, "failure_rate_percent": 30}'
+
+# Disable quickly without clearing the values
+curl -s -X PUT http://localhost:8000/admin/failure \
+  -H 'content-type: application/json' -d '{"enabled": false}'
+
+# Reset everything back to normal
+curl -s -X DELETE http://localhost:8000/admin/failure
+```
+
+An injected 500 uses the same error envelope as the rest of the API:
+
+```json
+{
+  "error": {
+    "code": "injected_failure",
+    "message": "Simulated internal server error (controlled failure injection)."
+  },
+  "request_id": "a46d84a5547740818b17770d79a6bba3"
+}
+```
+
+### Restoring normal behaviour
+
+`DELETE /admin/failure` (shown above) disables the scenario *and* clears the
+values. If you would rather keep the values but stop injecting, send
+`{"enabled": false}`. Restarting the API also resets the scenario, since it is
+held in memory only.
+
+### Observing the impact in Grafana
+
+Injected behaviour flows through the instrumentation that already exists — no
+separate metrics are defined for it:
+
+- Injected 500s increment
+  `orders_api_http_requests_total{status_code="500"}` and light up the **Error
+  Rate (4xx + 5xx)**, **HTTP Requests by Status Code** and **P95 Request
+  Latency** panels on the *Orders API – Service Overview* dashboard.
+- The injected delay raises `orders_api_http_request_duration_seconds`, so the
+  **P95 Request Latency** and **Request Latency Percentiles** panels climb by
+  roughly the configured amount.
+- Every injected failure emits an `injected_failure` warning in the log (with
+  the path, method and rate), followed by the usual `http_request` line with
+  `http_status: 500`.
+
+A ready-made demo loop:
+
+```bash
+# 40% failures + 400 ms latency
+curl -s -X PUT http://localhost:8000/admin/failure \
+  -H 'content-type: application/json' \
+  -d '{"enabled": true, "latency_ms": 400, "failure_rate_percent": 40}'
+
+# send traffic for ~12 seconds
+for i in $(seq 1 60); do
+  curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" http://localhost:8000/api/orders
+  sleep 0.2
+done
+
+# back to normal
+curl -s -X DELETE http://localhost:8000/admin/failure
+```
+
+Watch http://localhost:3000 (Grafana) and http://localhost:9090 (Prometheus)
+while it runs. `/health` and `/ready` keep returning `200` throughout, which is
+the point: the service is *slow and erroring*, not *down*.
+
 ## Configuration
 
 All settings are read from environment variables, falling back to `.env` and
@@ -329,8 +467,12 @@ then to the defaults below. Every variable is prefixed with `ORDERS_API_`.
 | `ORDERS_API_METRICS_ENABLED`   | `true`        | Set to `false` to remove `/metrics` and record nothing. |
 | `ORDERS_API_METRICS_PATH`      | `/metrics`    | Scrape endpoint path.                                  |
 | `ORDERS_API_METRICS_INCLUDE_PROBES` | `false`  | Count `/health` and `/ready` as application traffic.   |
+| `ORDERS_API_FAILURE_INJECTION_ENABLED` | `false` | Enable the `/admin/failure` control API. Refused in production. |
+| `ORDERS_API_FAILURE_INJECTION_PATH` | `/admin/failure` | Control API path when injection is enabled.      |
 
-Invalid values fail fast at start-up rather than at the first request.
+Invalid values fail fast at start-up rather than at the first request. Enabling
+failure injection in a production environment is one such invalid value: the
+process refuses to start.
 
 ## Example API calls
 
@@ -619,6 +761,8 @@ app/
   logging_config.py  structured JSON logging and request context
   middleware.py      request correlation, access logging and HTTP metrics
   metrics.py         metric definitions, registry and route-template resolver
+  failure_injection.py
+                     controlled latency/500 scenario and middleware
   errors.py          error types and the shared error envelope
   models.py          request/response schemas and money rules
   repository.py      order data access
@@ -627,6 +771,7 @@ app/
     health.py        /health and /ready
     orders.py        /api/orders endpoints
     metrics.py       /metrics scrape endpoint
+    failure.py       /admin/failure control API (demo only)
 run.py               entrypoint, binds using environment config
 tests/               pytest suite
 ```
@@ -640,3 +785,7 @@ Prometheus collects and stores the metrics locally and Grafana visualises
 them, but nothing alerts on top of that data yet — that is the next milestone.
 The dashboard is provisioned from git, so the whole stack can be recreated on a
 fresh machine with a single `docker compose up`.
+
+Failure injection here is a deliberately small, flag-gated demo tool. It is not
+scheduled chaos engineering, not a production fault-injection framework, and it
+adds no new metrics of its own.

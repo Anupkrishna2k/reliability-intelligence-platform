@@ -18,11 +18,12 @@ from app.errors import (
     unhandled_exception_handler,
     validation_exception_handler,
 )
+from app.failure_injection import FailureInjector
 from app.logging_config import configure_logging, get_logger
 from app.metrics import Metrics, RouteTemplateResolver
-from app.middleware import RequestContextMiddleware
+from app.middleware import FailureInjectionMiddleware, RequestContextMiddleware
 from app.repository import OrderRepository
-from app.routers import health, metrics, orders
+from app.routers import failure, health, metrics, orders
 
 _UTC = timezone.utc
 
@@ -73,18 +74,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_tags=[
             {"name": "health", "description": "Liveness and readiness probes."},
             {"name": "orders", "description": "Order queries."},
+            {
+                "name": "failure-injection",
+                "description": (
+                    "Local-development only. Controlled latency and HTTP 500 "
+                    "injection, absent unless explicitly enabled."
+                ),
+            },
         ],
     )
 
     application.state.settings = settings
     application.state.metrics = Metrics(settings)
+    application.state.failure_injector = FailureInjector(settings)
 
     application.include_router(health.router)
     application.include_router(orders.router, prefix=settings.api_prefix)
 
+    if settings.failure_injection_enabled:
+        application.include_router(failure.build_router(settings.failure_injection_path))
+        logger.warning(
+            "failure_injection_enabled",
+            extra={"control_path": settings.failure_injection_path},
+        )
+    else:
+        logger.info("failure_injection_disabled")
+
     # Route templates come from the documented API surface, so metrics always
     # agree with the OpenAPI schema and carry no per-request path values.
     route_resolver = RouteTemplateResolver(application.openapi()["paths"].keys())
+
+    # Failure injection runs *inside* the request-context middleware: the delay
+    # and any injected 500 are then logged and measured by the existing
+    # instrumentation rather than by a parallel set of metrics.
+    application.add_middleware(
+        FailureInjectionMiddleware,
+        settings=settings,
+        injector=application.state.failure_injector,
+    )
     application.add_middleware(
         RequestContextMiddleware, settings=settings, route_resolver=route_resolver
     )
