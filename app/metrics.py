@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -30,6 +30,19 @@ from prometheus_client import (
 )
 
 from app.config import Settings
+
+if TYPE_CHECKING:
+    from app.models import ErrorBudget, ReliabilityResponse
+
+#: Label values for the ``slo`` dimension on the reliability gauges. Two
+#: bounded values keep the reliability export to a handful of series.
+SLO_AVAILABILITY = "availability"
+SLO_LATENCY = "latency"
+SLO_VALUES = (SLO_AVAILABILITY, SLO_LATENCY)
+
+#: Prometheus renders a ``float('nan')`` gauge as ``NaN``. It is used for
+#: "insufficient data" so a dashboard shows a gap rather than a false 0/100%.
+_NAN = float("nan")
 
 # Prometheus metric names cannot contain dashes, so the service name is
 # spelled out rather than derived from settings.app_name.
@@ -189,12 +202,85 @@ class Metrics:
             registry=self.registry,
         )
 
+        # --- reliability / SLOs -------------------------------------------
+        # These gauges are computed from the rolling reliability window. They
+        # are refreshed on every Prometheus scrape (and when the reliability
+        # endpoint is called), so scraping always sees current values without
+        # recomputing on the request hot path.
+        self.slo_target = Gauge(
+            f"{METRIC_NAMESPACE}_slo_target",
+            "Configured SLO target ratio, by SLO name ('availability' or 'latency').",
+            ["slo"],
+            registry=self.registry,
+        )
+        self.slo_observed = Gauge(
+            f"{METRIC_NAMESPACE}_slo_observed",
+            "Observed SLI ratio over the rolling window, by SLO name. NaN when insufficient data.",
+            ["slo"],
+            registry=self.registry,
+        )
+        self.slo_compliant = Gauge(
+            f"{METRIC_NAMESPACE}_slo_compliant",
+            "1 when the observed SLI meets the SLO target, 0 when breached, NaN when insufficient data.",
+            ["slo"],
+            registry=self.registry,
+        )
+        self.error_budget_allowed_fraction = Gauge(
+            f"{METRIC_NAMESPACE}_error_budget_allowed_fraction",
+            "Allowed failure fraction (1 - target) of the error budget, by SLO name.",
+            ["slo"],
+            registry=self.registry,
+        )
+        self.error_budget_observed_failure_fraction = Gauge(
+            f"{METRIC_NAMESPACE}_error_budget_observed_failure_fraction",
+            "Observed failure fraction (1 - observed SLI), by SLO name.",
+            ["slo"],
+            registry=self.registry,
+        )
+        self.error_budget_consumed_fraction = Gauge(
+            f"{METRIC_NAMESPACE}_error_budget_consumed_fraction",
+            "Fraction of the allowed error budget consumed; may exceed 1.0, by SLO name.",
+            ["slo"],
+            registry=self.registry,
+        )
+        self.error_budget_remaining_fraction = Gauge(
+            f"{METRIC_NAMESPACE}_error_budget_remaining_fraction",
+            "Remaining error budget fraction, floored at 0.0, by SLO name.",
+            ["slo"],
+            registry=self.registry,
+        )
+        self.error_budget_exhausted = Gauge(
+            f"{METRIC_NAMESPACE}_error_budget_exhausted",
+            "1 when the error budget is consumed/exceeded, 0 otherwise, by SLO name.",
+            ["slo"],
+            registry=self.registry,
+        )
+
         # Version and environment are constant per deployment, so this is one
         # bounded series rather than a per-request label.
         self.build_info.labels(
             version=settings.app_version, environment=settings.environment
         ).set(1)
         self.ready.set(0)
+
+        # Targets are known at construction, so they are exported immediately;
+        # observed/budget values wait for real observations and read as NaN
+        # (insufficient data) until then.
+        self.slo_target.labels(slo=SLO_AVAILABILITY).set(settings.slo_availability_target)
+        self.slo_target.labels(slo=SLO_LATENCY).set(settings.slo_latency_target)
+        self.error_budget_allowed_fraction.labels(slo=SLO_AVAILABILITY).set(
+            1.0 - settings.slo_availability_target
+        )
+        self.error_budget_allowed_fraction.labels(slo=SLO_LATENCY).set(
+            1.0 - settings.slo_latency_target
+        )
+        for name in SLO_VALUES:
+            self.slo_observed.labels(slo=name).set(_NAN)
+            self.slo_compliant.labels(slo=name).set(_NAN)
+            self.error_budget_observed_failure_fraction.labels(slo=name).set(_NAN)
+            self.error_budget_consumed_fraction.labels(slo=name).set(_NAN)
+            self.error_budget_remaining_fraction.labels(slo=name).set(_NAN)
+            self.error_budget_exhausted.labels(slo=name).set(_NAN)
 
         self._status_filter_labels = _status_filter_values()
 
@@ -230,6 +316,61 @@ class Metrics:
     def set_ready(self, is_ready: bool) -> None:
         """Publish the outcome of the most recent readiness check."""
         self.ready.set(1 if is_ready else 0)
+
+    def update_reliability(self, snapshot: "ReliabilityResponse") -> None:
+        """Publish a reliability evaluation onto the SLO and budget gauges.
+
+        Absent ("insufficient data") values are published as ``NaN`` so a
+        dashboard or alert sees a gap instead of a misleading 0 or 100%.
+        """
+        self._publish_sli(
+            SLO_AVAILABILITY,
+            snapshot.availability.observed,
+            snapshot.availability.status,
+            snapshot.error_budget,
+        )
+        self._publish_sli(
+            SLO_LATENCY,
+            snapshot.latency.observed,
+            snapshot.latency.status,
+            snapshot.latency_error_budget,
+        )
+
+    def _publish_sli(
+        self,
+        name: str,
+        observed: float | None,
+        status: str,
+        budget: "ErrorBudget",
+    ) -> None:
+        sufficient = observed is not None and budget.sufficient_data
+        self.slo_observed.labels(slo=name).set(_NAN if observed is None else observed)
+        if not sufficient:
+            # Both statuses below "meeting_target" (at_risk) and "breached"
+            # count as not compliant, which is what an alert wants.
+            self.slo_compliant.labels(slo=name).set(_NAN)
+        else:
+            self.slo_compliant.labels(slo=name).set(1.0 if status != "breached" else 0.0)
+
+        self.error_budget_allowed_fraction.labels(slo=name).set(
+            budget.allowed_failure_fraction
+        )
+        self._set_optional(
+            self.error_budget_observed_failure_fraction, name, budget.observed_failure_fraction
+        )
+        self._set_optional(
+            self.error_budget_consumed_fraction, name, budget.consumed_fraction
+        )
+        self._set_optional(
+            self.error_budget_remaining_fraction, name, budget.remaining_fraction
+        )
+        self.error_budget_exhausted.labels(slo=name).set(
+            _NAN if not sufficient else (1.0 if budget.exhausted else 0.0)
+        )
+
+    @staticmethod
+    def _set_optional(gauge: Gauge, name: str, value: float | None) -> None:
+        gauge.labels(slo=name).set(_NAN if value is None else value)
 
     # --- exposition --------------------------------------------------------
 

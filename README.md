@@ -4,13 +4,17 @@ An SRE/DevOps portfolio project. This repository is built in stages; the goal
 is to grow a small but realistic service into a fully instrumented, observable,
 and safely deployed system.
 
-**Current stage: local observability** — the Orders API runs as a Docker
-Compose stack next to a Prometheus server that scrapes it, with a provisioned
-Grafana dashboard on top. This stage adds **controlled failure injection**: a
-flag-gated control API that adds artificial latency and HTTP 500s on demand, so
-the existing metrics and dashboard can be shown reacting to a realistic
-incident. It is disabled by default and refused in production. Alerting and
-deployment stages come later.
+**Current stage: reliability layer** — the Orders API runs as a Docker Compose
+stack next to a Prometheus server that scrapes it, with a provisioned Grafana
+dashboard on top. On top of the existing instrumentation this stage adds
+**service-level indicators, objectives and an error budget**: the service
+measures its own availability and latency over a rolling window, compares them
+with configurable SLOs, exports the result as both a JSON API and Prometheus
+gauges, and visualises it in Grafana. It also keeps the earlier **controlled
+failure injection** — a flag-gated control API that adds artificial latency and
+HTTP 500s on demand — which is the easiest way to drive the reliability layer
+into a breach and back. Failure injection is disabled by default and refused in
+production. Alerting and deployment stages come later.
 
 ## What this service is
 
@@ -32,6 +36,7 @@ be swapped in later without touching the HTTP layer.
 | `GET`  | `/ready`                | Readiness. Answers "can it serve traffic?" — `503` when not.   |
 | `GET`  | `/api/orders`           | Paginated, filterable order list, newest first.                |
 | `GET`  | `/api/orders/{order_id}`| Full order detail including line items and money totals.       |
+| `GET`  | `/api/reliability`      | Rolling SLI/SLO evaluation and error budget as JSON.          |
 | `GET`  | `/metrics`              | Prometheus metrics, for scraping.                             |
 | `GET`  | `/admin/failure`        | Read failure-injection scenario. Only when enabled (see below). |
 | `PUT`  | `/admin/failure`        | Configure latency and/or HTTP 500 rate. Only when enabled.    |
@@ -187,9 +192,17 @@ from git.
 | Request Rate by Route       | Rate per route template (low-cardinality by design).               |
 | Application / Build Info    | `orders_api_build_info` version + environment labels.              |
 | Prometheus Scrape Target    | `up{job="reliability-api"}` — is the metrics pipeline alive?       |
+| Availability SLI vs SLO     | Observed vs target availability (`orders_api_slo_*{slo="availability"}`). |
+| Latency Compliance vs SLO   | Observed vs target latency compliance.                            |
+| Error Budget Remaining      | `orders_api_error_budget_remaining_fraction{slo="availability"}`. |
+| Reliability Eval Status     | `orders_api_slo_compliant` — `COMPLIANT`/`BREACHED`/`INSUFFICIENT DATA`. |
+| Reliability SLIs vs SLOs    | Time series of observed vs target for both SLIs.                  |
+| Error Budget: Remaining vs Consumed | `remaining_fraction` and `consumed_fraction` over time.     |
 
 Only metrics the application already exposes are used — nothing was invented
-for the dashboard.
+for the dashboard. The reliability panels show **INSUFFICIENT DATA** rather
+than a false green when the rolling window is empty. See
+[SLI, SLO and error budget](#sli-slo-and-error-budget) for the definitions.
 
 ### Generating demo traffic
 
@@ -446,6 +459,295 @@ Watch http://localhost:3000 (Grafana) and http://localhost:9090 (Prometheus)
 while it runs. `/health` and `/ready` keep returning `200` throughout, which is
 the point: the service is *slow and erroring*, not *down*.
 
+## SLI, SLO and error budget
+
+This is the reliability layer. It answers three questions continuously:
+
+1. **How is the service doing?** — the *service-level indicator* (SLI), a ratio
+   measured over a rolling window.
+2. **How good does it need to be?** — the *service-level objective* (SLO), a
+   target for that indicator.
+3. **How much room for failure is left?** — the *error budget*, derived from the
+   SLO and how much of it has already been spent.
+
+The evaluation is exposed as JSON at `GET /api/reliability`, as Prometheus
+gauges on `/metrics`, and as panels on the Grafana dashboard.
+
+### Definitions and formulas
+
+| Term                     | Definition |
+| ------------------------ | ---------- |
+| **Availability SLI**     | `successful requests / eligible requests` over the window. |
+| **Availability SLO**     | Target availability ratio. Default **99.5%** (`0.995`). |
+| **Latency SLI**          | `requests within threshold / eligible requests` over the window. |
+| **Latency SLO**          | Target latency-compliance ratio. Default **95%** (`0.95`). |
+| **Latency threshold**    | A request is "within threshold" when its duration is `<=` the threshold. Default **500 ms**. |
+| **Observation window**   | Rolling period the SLIs are computed over. Default **5 minutes** (`300 s`). |
+| **Allowed failure fraction** | `1 - SLO target`. At 99.5% availability this is **0.5%**. |
+| **Observed failure fraction** | `1 - observed SLI`. |
+| **Budget consumed**      | `observed failure fraction / allowed failure fraction`. Can exceed `1.0`. |
+| **Budget remaining**     | `1 - consumed`, **floored at 0.0**. |
+| **Budget exhausted**     | `consumed >= 1.0` (the observed failures met or exceeded the allowed budget). |
+
+Worked example — availability, over the window:
+
+```
+eligible = 1000, successful = 996, failed (5xx) = 4
+observed availability   = 996 / 1000            = 0.996   (99.6%)
+allowed failure fraction = 1 - 0.995            = 0.005   (0.5%)
+observed failure fraction = 1 - 0.996           = 0.004   (0.4%)
+budget consumed          = 0.004 / 0.005        = 0.80    (80%)
+budget remaining         = 1 - 0.80             = 0.20    (20%)
+exhausted                = false
+```
+
+If instead there were 4 failures out of 796 successes (800 requests), the
+observed failure fraction is exactly the allowed `0.5%`, so `consumed = 1.0`,
+`remaining = 0.0`, `exhausted = true`. Ten failures out of 100 requests gives
+`consumed = 20.0` (2000% of budget): the JSON reports `consumed_fraction:
+20.0` and `remaining_fraction: 0.0` (floored), with `exhausted: true`. The
+budget is never reported as a misleading negative percentage; overrun is
+represented by `consumed_fraction > 1.0`.
+
+The latency SLO gets the same budget treatment (`latency_error_budget` in the
+API, and `orders_api_error_budget_*{slo="latency"}` metrics); the availability
+budget is the one emphasised in the docs and dashboard.
+
+### HTTP status-code classification
+
+The availability policy is deliberately explicit:
+
+| Response           | Counts as                    | Why |
+| ------------------ | ---------------------------- | --- |
+| `1xx`, `2xx`, `3xx`| **success**                  | The service did its job. |
+| `4xx`              | **success** (not a failure)  | A `4xx` is a *client* error — a bad request or a missing resource. Counting it as a service failure would let a misbehaving client burn the service's error budget. `404`s for unknown order ids are normal traffic. |
+| `5xx`              | **failure**                  | The service failed to serve the request. Injected HTTP 500s from the failure-injection control are `5xx` and therefore count as failures. |
+
+### What is excluded from the calculation
+
+Reliability measures **user-facing** behaviour, so administrative and
+non-application traffic is excluded:
+
+- `/health` and `/ready` — probes run on a fixed timer.
+- `/metrics` — Prometheus scrapes on a fixed timer.
+- `/admin/failure` — the failure-injection control plane.
+- `/api/reliability` — this endpoint, so it never measures itself.
+- **unmatched paths** — scanner/noise traffic that matches no route.
+
+The tracker observes each request at the *same* point in the middleware and
+with the *same* route-template label as `orders_api_http_requests_total`, so the
+SLI and the HTTP metrics can never disagree about what happened.
+
+### Observation-window semantics
+
+- The window is **rolling**: it always covers the most recent
+  `slo_window_seconds`, not a fixed calendar interval. Each evaluation evicts
+  samples older than the window.
+- Samples are kept in a bounded, time-stamped buffer in memory. The clock is
+  monotonic, so window arithmetic is immune to wall-clock adjustments.
+- A restart (or counter reset) simply empties the buffer: the reliability layer
+  starts fresh and reports `insufficient_data` until new traffic arrives. It
+  never reads the cumulative Prometheus counters back, which is why a counter
+  reset cannot corrupt the SLI.
+- The default window is short on purpose, so the local demo reacts within a
+  scrape or two. Tune `ORDERS_API_SLO_WINDOW_SECONDS` for other environments.
+
+### Insufficient data
+
+If there are **no eligible requests** in the window, the indicator cannot be
+computed. Rather than reporting a meaningless 100%, the service returns the
+status `insufficient_data`:
+
+- JSON: `observed: null`, `sufficient_data: false`.
+- Prometheus: the observed/compliance gauges are exported as `NaN` (which
+  Grafana shows as a gap, thanks to the panels' `INSUFFICIENT DATA` no-value).
+- Grafana: the reliability stat panels display **INSUFFICIENT DATA**, never a
+  false green.
+
+### Statuses
+
+Both SLIs use the same four-value vocabulary:
+
+| Status              | Meaning |
+| ------------------- | ------- |
+| `meeting_target`    | Observed ratio `>=` target and more than the at-risk share of the error budget remains. |
+| `at_risk`           | Observed ratio still `>=` target, but the remaining error budget is `<=` `slo_at_risk_budget_remaining` (default **0.25**, i.e. 75% consumed). Not yet breached, but close. |
+| `breached`          | Observed ratio `<` target. |
+| `insufficient_data` | No eligible requests in the window. |
+
+The `at_risk` rule is a single, documented threshold on the *same* error budget
+the rest of the module reports — it is not an invented separate score. With the
+defaults it fires when availability sits in `[99.5%, 99.625%]`: still meeting
+the objective, but with three quarters of the budget already spent. The
+top-level `status` is the most severe of the two indicators.
+
+### Reliability endpoint
+
+```bash
+curl -s http://localhost:8000/api/reliability | python3 -m json.tool
+```
+
+```json
+{
+  "service": "orders-api",
+  "generated_at": "2026-10-14T12:00:00.000000Z",
+  "evaluation_window_seconds": 300,
+  "status": "at_risk",
+  "availability": {
+    "target": 0.995,
+    "observed": 0.996,
+    "status": "at_risk",
+    "window_seconds": 300,
+    "eligible_requests": 1000,
+    "successful_requests": 996,
+    "failed_requests": 4,
+    "sufficient_data": true
+  },
+  "latency": {
+    "target": 0.95,
+    "observed": 0.99,
+    "status": "meeting_target",
+    "window_seconds": 300,
+    "eligible_requests": 1000,
+    "within_threshold_requests": 990,
+    "latency_threshold_ms": 500.0,
+    "sufficient_data": true
+  },
+  "error_budget": {
+    "slo": "availability",
+    "target": 0.995,
+    "observed": 0.996,
+    "allowed_failure_fraction": 0.005,
+    "observed_failure_fraction": 0.004,
+    "consumed_fraction": 0.8,
+    "remaining_fraction": 0.2,
+    "exhausted": false,
+    "sufficient_data": true
+  },
+  "latency_error_budget": { "...": "same shape, for the latency SLO" },
+  "status_definitions": { "...": "human-readable definition of each status" },
+  "notes": [ "... the policy notes above, machine-readable" ]
+}
+```
+
+### Reliability metrics
+
+The service exports the evaluation as low-cardinality gauges on `/metrics`,
+labelled by `slo` (`availability` or `latency`). They are refreshed on every
+scrape, so a scrape and a `/api/reliability` call always agree.
+
+| Metric | Meaning |
+| ------ | ------- |
+| `orders_api_slo_target{slo}` | Configured target ratio. |
+| `orders_api_slo_observed{slo}` | Observed SLI ratio; `NaN` when insufficient data. |
+| `orders_api_slo_compliant{slo}` | `1` meeting target, `0` breached, `NaN` insufficient. |
+| `orders_api_error_budget_allowed_fraction{slo}` | `1 - target`. |
+| `orders_api_error_budget_observed_failure_fraction{slo}` | `1 - observed SLI`. |
+| `orders_api_error_budget_consumed_fraction{slo}` | Budget consumed; may exceed `1.0`. |
+| `orders_api_error_budget_remaining_fraction{slo}` | Budget remaining, floored at `0.0`. |
+| `orders_api_error_budget_exhausted{slo}` | `1` when exhausted, else `0`. |
+
+Useful queries in the Prometheus UI at http://localhost:9090:
+
+```promql
+# Observed availability
+orders_api_slo_observed{slo="availability"}
+
+# Which SLOs are currently breached?
+orders_api_slo_compliant == 0
+
+# Remaining availability budget
+orders_api_error_budget_remaining_fraction{slo="availability"}
+
+# Budget exhaustion as a percentage consumed
+orders_api_error_budget_consumed_fraction{slo="availability"} * 100
+```
+
+### Grafana panels
+
+The *Orders API – Service Overview* dashboard is extended (not duplicated) with
+a reliability section. The existing panels are unchanged.
+
+| Panel | What it shows (query) |
+| ----- | --------------------- |
+| Availability SLI vs SLO | observed vs target availability. |
+| Latency Compliance vs SLO | observed vs target latency compliance. |
+| Error Budget Remaining (Availability) | `orders_api_error_budget_remaining_fraction{slo="availability"}`. |
+| Reliability Evaluation Status | `orders_api_slo_compliant` for both SLIs: `COMPLIANT`/`BREACHED`/`INSUFFICIENT DATA`. |
+| Reliability SLIs vs SLOs | time series of observed vs target for both SLIs. |
+| Error Budget: Remaining vs Consumed | `remaining_fraction` and `consumed_fraction` over time. |
+
+All reliability panels are configured with `INSUFFICIENT DATA` as their no-value,
+so an empty window shows a gap rather than a false 100% or green status.
+
+### Demonstrating a breach (and recovering)
+
+Use the existing failure-injection controls to drive the reliability layer into
+a breach, then watch it recover. The reliability endpoint and `/metrics` are
+exempt from injection, so they always report truthfully.
+
+```bash
+# 1. Baseline: send healthy traffic for a minute or so.
+for i in $(seq 1 60); do
+  curl -s -o /dev/null http://localhost:8000/api/orders
+  sleep 1
+done
+curl -s http://localhost:8000/api/reliability | python3 -m json.tool
+
+# 2. Inject 100% HTTP 500s on application requests.
+curl -s -X PUT http://localhost:8000/admin/failure \
+  -H 'content-type: application/json' \
+  -d '{"enabled": true, "failure_rate_percent": 100}'
+
+# 3. Send a burst of failing requests.
+for i in $(seq 1 40); do curl -s -o /dev/null http://localhost:8000/api/orders; done
+
+# 4. The endpoint now reports a breach and an exhausted budget.
+curl -s http://localhost:8000/api/reliability | python3 -m json.tool
+#   "availability.status": "breached", "observed" near 0
+#   "error_budget.exhausted": true, "remaining_fraction": 0.0
+
+# --- or drive the latency SLO instead ---
+curl -s -X PUT http://localhost:8000/admin/failure \
+  -H 'content-type: application/json' \
+  -d '{"enabled": true, "latency_ms": 800, "failure_rate_percent": 0}'
+for i in $(seq 1 40); do curl -s -o /dev/null http://localhost:8000/api/orders; done
+curl -s http://localhost:8000/api/reliability | python3 -m json.tool
+#   "latency.status": "breached"
+
+# 5. Restore normal behaviour.
+curl -s -X DELETE http://localhost:8000/admin/failure
+
+# 6. Recovery: healthy traffic pushes the failures out of the rolling window.
+for i in $(seq 1 60); do
+  curl -s -o /dev/null http://localhost:8000/api/orders
+  sleep 1
+done
+curl -s http://localhost:8000/api/reliability | python3 -m json.tool
+#   availability is meeting_target again once the window has moved on
+```
+
+In Grafana, watch **Reliability Evaluation Status** flip to `BREACHED`,
+**Error Budget Remaining** fall to 0% and **Error Budget: Remaining vs
+Consumed** spike above 100%, then settle back as the rolling window fills with
+healthy requests.
+
+### Notes and limitations
+
+- The first version ships an **availability error budget** as the primary
+  budget. A latency budget is computed with the same formulas and exported
+  consistently, but is not the focus of the dashboard section.
+- The tracker keeps samples in process memory for the configured window. There
+  is no database and no cross-instance aggregation; with multiple replicas each
+  instance reports its own view (as Prometheus would scrape each one).
+- Latency compliance uses each request's **exact** duration, so it is correct
+  for any configured threshold. The HTTP histogram's buckets were inspected
+  when choosing this method: the default 500 ms threshold is one of those
+  buckets, but a configured threshold need not be, and exact durations avoid
+  the interpolation error a bucket-only calculation would introduce.
+- The reliability endpoint is evaluated synchronously from an in-memory buffer,
+  so its cost is proportional to the number of requests in the window.
+
 ## Configuration
 
 All settings are read from environment variables, falling back to `.env` and
@@ -469,6 +771,12 @@ then to the defaults below. Every variable is prefixed with `ORDERS_API_`.
 | `ORDERS_API_METRICS_INCLUDE_PROBES` | `false`  | Count `/health` and `/ready` as application traffic.   |
 | `ORDERS_API_FAILURE_INJECTION_ENABLED` | `false` | Enable the `/admin/failure` control API. Refused in production. |
 | `ORDERS_API_FAILURE_INJECTION_PATH` | `/admin/failure` | Control API path when injection is enabled.      |
+| `ORDERS_API_SLO_AVAILABILITY_TARGET` | `0.995` | Availability SLO target ratio (strictly between 0 and 1). |
+| `ORDERS_API_SLO_LATENCY_TARGET` | `0.95` | Latency-compliance SLO target ratio (strictly between 0 and 1). |
+| `ORDERS_API_SLO_LATENCY_THRESHOLD_MS` | `500` | Latency threshold in milliseconds; requests at or below it are compliant. |
+| `ORDERS_API_SLO_WINDOW_SECONDS` | `300` | Rolling observation window in seconds. |
+| `ORDERS_API_SLO_AT_RISK_BUDGET_REMAINING` | `0.25` | Flag an SLO `at_risk` once its remaining budget is at or below this fraction. |
+| `ORDERS_API_RELIABILITY_PATH` | `/api/reliability` | Reliability evaluation endpoint path. |
 
 Invalid values fail fast at start-up rather than at the first request. Enabling
 failure injection in a production environment is one such invalid value: the
@@ -671,6 +979,14 @@ immediately from `orders_api_order_lookups_total{outcome="not_found"}`.
 | `orders_api_orders_matched`             | Histogram | —                  | How many orders matched the filters (catches a broken filter). |
 | `orders_api_ready`                      | Gauge     | —                  | Readiness as last reported by `/ready` (1/0).           |
 | `orders_api_build_info`                 | Gauge     | `version`, `environment` | Which build is answering. Always `1`.            |
+| `orders_api_slo_target`                 | Gauge     | `slo`              | Configured SLO target for `availability`/`latency`.     |
+| `orders_api_slo_observed`               | Gauge     | `slo`              | Observed SLI; `NaN` when insufficient data.            |
+| `orders_api_slo_compliant`              | Gauge     | `slo`              | `1` meeting target, `0` breached, `NaN` insufficient.  |
+| `orders_api_error_budget_allowed_fraction` | Gauge  | `slo`              | `1 - target`.                                          |
+| `orders_api_error_budget_observed_failure_fraction` | Gauge | `slo`        | `1 - observed SLI`.                                    |
+| `orders_api_error_budget_consumed_fraction` | Gauge | `slo`             | Budget consumed; may exceed `1.0`.                     |
+| `orders_api_error_budget_remaining_fraction` | Gauge | `slo`            | Budget remaining, floored at `0.0`.                    |
+| `orders_api_error_budget_exhausted`     | Gauge     | `slo`              | `1` when the budget is exhausted, else `0`.            |
 
 Example output after a few requests:
 
@@ -763,6 +1079,7 @@ app/
   metrics.py         metric definitions, registry and route-template resolver
   failure_injection.py
                      controlled latency/500 scenario and middleware
+  reliability.py     rolling-window SLI/SLO/error-budget calculation
   errors.py          error types and the shared error envelope
   models.py          request/response schemas and money rules
   repository.py      order data access
@@ -770,6 +1087,7 @@ app/
   routers/
     health.py        /health and /ready
     orders.py        /api/orders endpoints
+    reliability.py   /api/reliability SLI/SLO evaluation
     metrics.py       /metrics scrape endpoint
     failure.py       /admin/failure control API (demo only)
 run.py               entrypoint, binds using environment config
@@ -782,9 +1100,10 @@ Deliberately deferred to later stages: Alertmanager, Kubernetes, Terraform,
 AWS, CI/CD, a database, and authentication.
 
 Prometheus collects and stores the metrics locally and Grafana visualises
-them, but nothing alerts on top of that data yet — that is the next milestone.
-The dashboard is provisioned from git, so the whole stack can be recreated on a
-fresh machine with a single `docker compose up`.
+them. The reliability layer now computes SLIs against SLOs and derives an error
+budget, but nothing **alerts** on top of that data yet — Alertmanager is a later
+milestone. The dashboard is provisioned from git, so the whole stack can be
+recreated on a fresh machine with a single `docker compose up`.
 
 Failure injection here is a deliberately small, flag-gated demo tool. It is not
 scheduled chaos engineering, not a production fault-injection framework, and it

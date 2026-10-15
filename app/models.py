@@ -228,6 +228,106 @@ class FailureConfigUpdate(BaseModel):
     )
 
 
+#: Reliability status vocabulary, shared by the availability and latency SLIs.
+#: ``insufficient_data`` is a first-class outcome: an empty window must never be
+#: reported as 100% availability.
+ReliabilityStatus = Literal["meeting_target", "at_risk", "breached", "insufficient_data"]
+
+
+class AvailabilitySli(BaseModel):
+    """Availability indicator over the rolling observation window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: float = Field(
+        gt=0, lt=1, description="Configured availability SLO (ratio)."
+    )
+    observed: float | None = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description="Observed availability (successful / eligible), or null if insufficient data.",
+    )
+    status: ReliabilityStatus
+    window_seconds: int = Field(ge=1)
+    eligible_requests: int = Field(ge=0)
+    successful_requests: int = Field(ge=0)
+    failed_requests: int = Field(ge=0, description="Eligible requests answered with HTTP 5xx.")
+    sufficient_data: bool
+
+
+class LatencySli(BaseModel):
+    """Latency-compliance indicator over the rolling observation window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: float = Field(gt=0, lt=1, description="Configured latency-compliance SLO (ratio).")
+    observed: float | None = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description=(
+            "Fraction of eligible requests that completed within the threshold, "
+            "or null if insufficient data."
+        ),
+    )
+    status: ReliabilityStatus
+    window_seconds: int = Field(ge=1)
+    eligible_requests: int = Field(ge=0)
+    within_threshold_requests: int = Field(ge=0)
+    latency_threshold_ms: float = Field(gt=0)
+    sufficient_data: bool
+
+
+class ErrorBudget(BaseModel):
+    """Error budget derived from one SLO.
+
+    ``consumed_fraction`` is deliberately unbounded: a value above ``1.0`` means
+    the budget has been exceeded, and ``exhausted`` is the explicit flag for
+    that. ``remaining_fraction`` is floored at ``0.0`` so a dashboard never
+    shows a misleading negative remainder; over-consumption is visible through
+    ``consumed_fraction`` instead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slo: Literal["availability", "latency"]
+    target: float = Field(gt=0, lt=1)
+    observed: float | None = Field(default=None, ge=0, le=1)
+    allowed_failure_fraction: float = Field(ge=0, lt=1)
+    observed_failure_fraction: float | None = Field(default=None, ge=0, le=1)
+    consumed_fraction: float | None = Field(
+        default=None, ge=0, description="Observed/allowed failure fraction; may exceed 1."
+    )
+    remaining_fraction: float | None = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description="max(0, 1 - consumed_fraction); floored, never negative.",
+    )
+    exhausted: bool
+    sufficient_data: bool
+
+
+class ReliabilityResponse(BaseModel):
+    """Full reliability evaluation for the rolling observation window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    service: str
+    generated_at: datetime
+    evaluation_window_seconds: int = Field(ge=1)
+    status: ReliabilityStatus = Field(
+        description="Most severe status across availability and latency."
+    )
+    availability: AvailabilitySli
+    latency: LatencySli
+    error_budget: ErrorBudget = Field(description="Availability error budget.")
+    latency_error_budget: ErrorBudget
+    status_definitions: dict[str, str]
+    notes: list[str]
+
+
 class ErrorBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

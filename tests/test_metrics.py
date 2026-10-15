@@ -36,6 +36,7 @@ ALLOWED_LABEL_NAMES = {
     "version",
     "environment",
     "le",  # histogram bucket boundary
+    "slo",  # reliability SLO name ('availability' or 'latency')
 }
 
 #: Metric family names. Prometheus strips the `_total` suffix from a counter's

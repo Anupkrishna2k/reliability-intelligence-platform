@@ -25,6 +25,7 @@ from app.logging_config import (
     set_request_id,
 )
 from app.metrics import UNMATCHED_ROUTE, Metrics, RouteTemplateResolver
+from app.reliability import ReliabilityTracker
 
 REQUEST_ID_HEADER = "x-request-id"
 
@@ -52,7 +53,13 @@ class RequestContextMiddleware:
         self.settings = settings
         self.route_resolver = route_resolver
         self.logger = get_logger("app.access")
-        self._excluded = {*PROBE_PATHS, settings.metrics_path}
+        # The reliability endpoint is a read-out of the reliability data, not
+        # application traffic, so observing it would make it measure itself.
+        self._excluded = {
+            *PROBE_PATHS,
+            settings.metrics_path,
+            settings.reliability_path,
+        }
         if settings.failure_injection_enabled:
             # The failure-injection control plane is operational tooling, not
             # application traffic, so it is excluded just like the metrics path.
@@ -110,12 +117,29 @@ class RequestContextMiddleware:
                 self._metrics(scope).record_http_request(
                     scope.get("method"), route, status_code, duration_seconds
                 )
+                # The reliability tracker observes the same request, with the
+                # same route label and status classification, so the SLI and
+                # the HTTP metrics can never disagree about what happened.
+                tracker = self._reliability(scope)
+                if tracker is not None:
+                    tracker.record(
+                        route=route,
+                        status_code=status_code,
+                        duration_seconds=duration_seconds,
+                    )
             reset_request_id(token)
 
     @staticmethod
     def _metrics(scope: Scope) -> Metrics:
         application: FastAPI = scope["app"]
         return cast(Metrics, application.state.metrics)
+
+    @staticmethod
+    def _reliability(scope: Scope) -> ReliabilityTracker | None:
+        application: FastAPI = scope["app"]
+        return cast(
+            "ReliabilityTracker | None", getattr(application.state, "reliability", None)
+        )
 
     @staticmethod
     def _incoming_request_id(scope: Scope) -> str | None:
@@ -141,8 +165,9 @@ class FailureInjectionMiddleware:
     or failure is observed by the existing access log and HTTP metrics exactly
     like a real slow request or server error would be — no separate counters.
 
-    Probes, the metrics scrape and the control API itself are exempt, so the
-    instance stays observable and the injection can always be turned back off.
+    Probes, the metrics scrape, the control API and the reliability read-out
+    are exempt, so the instance stays observable and the injection can always be
+    turned back off.
     """
 
     def __init__(
@@ -159,6 +184,10 @@ class FailureInjectionMiddleware:
             *PROBE_PATHS,
             settings.metrics_path,
             settings.failure_injection_path,
+            # The reliability read-out must stay instant and truthful even
+            # while latency is being injected, otherwise it would report on the
+            # injection instead of the service.
+            settings.reliability_path,
         }
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

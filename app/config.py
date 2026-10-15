@@ -14,7 +14,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator, model_validator
+from pydantic import ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -27,6 +27,13 @@ VALID_LOG_FORMATS = {"json", "text"}
 #: meaningless as a probability.
 MAX_FAILURE_LATENCY_MS = 10_000
 MAX_FAILURE_RATE_PERCENT = 100.0
+
+#: Upper bound on the latency SLO threshold. A minute is far beyond any healthy
+#: read-only JSON API and keeps a typo from silently disabling the latency SLI.
+MAX_SLO_LATENCY_THRESHOLD_MS = 60_000.0
+#: Longest supported observation window (24 hours). The local stack uses the
+#: five-minute default; the cap just stops an accidental huge retention buffer.
+MAX_SLO_WINDOW_SECONDS = 86_400
 
 
 class Settings(BaseSettings):
@@ -68,6 +75,20 @@ class Settings(BaseSettings):
     failure_injection_enabled: bool = False
     failure_injection_path: str = "/admin/failure"
 
+    # Service-level objectives (SLOs) and the rolling reliability window. These
+    # drive the evaluation returned by ``reliability_path`` and the
+    # ``orders_api_slo_*`` / ``orders_api_error_budget_*`` gauges. Fractions are
+    # ratios in (0, 1); the defaults are a deliberately modest 99.5%
+    # availability and 95% latency compliance over the last five minutes.
+    slo_availability_target: float = 0.995
+    slo_latency_target: float = 0.95
+    slo_latency_threshold_ms: float = 500.0
+    slo_window_seconds: int = 300
+    # An SLO that is still met is flagged ``at_risk`` once less than this
+    # fraction of its allowed error budget remains (0.25 = 75% consumed).
+    slo_at_risk_budget_remaining: float = 0.25
+    reliability_path: str = "/api/reliability"
+
     # API behaviour
     api_prefix: str = "/api"
     default_page_size: int = 20
@@ -108,15 +129,56 @@ class Settings(BaseSettings):
             raise ValueError(f"metrics_path must start with '/', got {value!r}")
         return path
 
-    @field_validator("failure_injection_path")
+    @field_validator("failure_injection_path", "reliability_path")
     @classmethod
-    def _validate_failure_injection_path(cls, value: str) -> str:
+    def _validate_admin_path(cls, value: str, info: ValidationInfo) -> str:
         path = value.strip()
         if not path.startswith("/"):
-            raise ValueError(f"failure_injection_path must start with '/', got {value!r}")
+            raise ValueError(f"{info.field_name} must start with '/', got {value!r}")
         if path == "/":
-            raise ValueError("failure_injection_path must not be the site root")
+            raise ValueError(f"{info.field_name} must not be the site root")
         return path
+
+    @field_validator("slo_availability_target", "slo_latency_target")
+    @classmethod
+    def _validate_slo_target(cls, value: float, info: ValidationInfo) -> float:
+        # A target of 1.0 would allow no errors and make the error budget
+        # meaningless (a single failure exhausts it), so it is rejected.
+        if not 0.0 < value < 1.0:
+            raise ValueError(
+                f"{info.field_name} must be strictly between 0 and 1, got {value!r}"
+            )
+        return value
+
+    @field_validator("slo_at_risk_budget_remaining")
+    @classmethod
+    def _validate_at_risk_remaining(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                "slo_at_risk_budget_remaining must be between 0 and 1, "
+                f"got {value!r}"
+            )
+        return value
+
+    @field_validator("slo_latency_threshold_ms")
+    @classmethod
+    def _validate_latency_threshold(cls, value: float) -> float:
+        if not 0.0 < value <= MAX_SLO_LATENCY_THRESHOLD_MS:
+            raise ValueError(
+                "slo_latency_threshold_ms must be greater than 0 and at most "
+                f"{MAX_SLO_LATENCY_THRESHOLD_MS}, got {value!r}"
+            )
+        return value
+
+    @field_validator("slo_window_seconds")
+    @classmethod
+    def _validate_window(cls, value: int) -> int:
+        if not 1 <= value <= MAX_SLO_WINDOW_SECONDS:
+            raise ValueError(
+                "slo_window_seconds must be between 1 and "
+                f"{MAX_SLO_WINDOW_SECONDS}, got {value!r}"
+            )
+        return value
 
     @model_validator(mode="after")
     def _guard_failure_injection(self) -> "Settings":

@@ -27,6 +27,17 @@ def build_router(path: str = DEFAULT_METRICS_PATH) -> APIRouter:
     )
     async def metrics(request: Request) -> Response:
         application_metrics: Metrics = request.app.state.metrics
+
+        # Recompute the SLO/error-budget gauges at scrape time so Prometheus
+        # always collects a current evaluation without paying that cost on the
+        # request hot path.
+        tracker = getattr(request.app.state, "reliability", None)
+        if tracker is not None:
+            snapshot = tracker.snapshot().model_copy(
+                update={"service": request.app.state.settings.app_name}
+            )
+            application_metrics.update_reliability(snapshot)
+
         payload, content_type = application_metrics.render()
         return Response(content=payload, media_type=content_type)
 

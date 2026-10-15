@@ -20,10 +20,11 @@ from app.errors import (
 )
 from app.failure_injection import FailureInjector
 from app.logging_config import configure_logging, get_logger
-from app.metrics import Metrics, RouteTemplateResolver
+from app.metrics import UNMATCHED_ROUTE, Metrics, RouteTemplateResolver
 from app.middleware import FailureInjectionMiddleware, RequestContextMiddleware
+from app.reliability import ReliabilityTracker
 from app.repository import OrderRepository
-from app.routers import failure, health, metrics, orders
+from app.routers import failure, health, metrics, orders, reliability
 
 _UTC = timezone.utc
 
@@ -35,6 +36,7 @@ the Reliability Intelligence Platform.
 * `GET /ready` - readiness probe, returns 503 when a dependency check fails
 * `GET {api_prefix}/orders` - paginated, filterable order list
 * `GET {api_prefix}/orders/{{order_id}}` - full order detail
+* `GET {api_prefix}/reliability` - rolling SLI/SLO and error-budget evaluation
 * `GET /metrics` - Prometheus metrics for scraping
 """
 
@@ -81,15 +83,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "injection, absent unless explicitly enabled."
                 ),
             },
+            {
+                "name": "reliability",
+                "description": (
+                    "Rolling service-level indicators measured against the "
+                    "configured objectives, with the derived error budget."
+                ),
+            },
         ],
     )
 
     application.state.settings = settings
     application.state.metrics = Metrics(settings)
     application.state.failure_injector = FailureInjector(settings)
+    # Administrative routes are never part of user-facing reliability: probes,
+    # scrapes, the failure-control plane and this endpoint itself are excluded,
+    # along with unmatched (unrouted) paths.
+    application.state.reliability = ReliabilityTracker(
+        availability_target=settings.slo_availability_target,
+        latency_target=settings.slo_latency_target,
+        latency_threshold_ms=settings.slo_latency_threshold_ms,
+        window_seconds=settings.slo_window_seconds,
+        at_risk_budget_remaining=settings.slo_at_risk_budget_remaining,
+        excluded_routes={
+            "/health",
+            "/ready",
+            settings.metrics_path,
+            settings.failure_injection_path,
+            settings.reliability_path,
+            UNMATCHED_ROUTE,
+        },
+    )
 
     application.include_router(health.router)
     application.include_router(orders.router, prefix=settings.api_prefix)
+    application.include_router(reliability.build_router(settings.reliability_path))
 
     if settings.failure_injection_enabled:
         application.include_router(failure.build_router(settings.failure_injection_path))
