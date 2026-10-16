@@ -35,6 +35,19 @@ MAX_SLO_LATENCY_THRESHOLD_MS = 60_000.0
 #: five-minute default; the cap just stops an accidental huge retention buffer.
 MAX_SLO_WINDOW_SECONDS = 86_400
 
+#: Incident detection bounds. The interval is how often the detector evaluates
+#: the reliability window; too small a value would spend CPU re-evaluating an
+#: unchanged window, so it is capped at one hour. The recovery threshold is the
+#: number of consecutive healthy evaluations required before an incident is
+#: closed, and the history limit bounds the number of resolved records retained
+#: in memory.
+MAX_INCIDENT_EVAL_INTERVAL_SECONDS = 3_600.0
+MAX_INCIDENT_RECOVERY_EVALUATIONS = 100
+MAX_INCIDENT_HISTORY = 100_000
+#: Upper bound on the budget-exhaustion multiple at which an availability
+#: incident is treated as `critical` rather than `warning`.
+MAX_INCIDENT_CRITICAL_BUDGET_CONSUMED = 1_000.0
+
 
 class Settings(BaseSettings):
     """Runtime configuration for the Orders API."""
@@ -89,6 +102,24 @@ class Settings(BaseSettings):
     slo_at_risk_budget_remaining: float = 0.25
     reliability_path: str = "/api/reliability"
 
+    # Incident detection and lifecycle. The detector evaluates the reliability
+    # window on a timer and opens or closes in-memory incident records from the
+    # SLO rules. All incident state is process-local and lost on restart. See
+    # the README for the detection rules, severity policy and recovery rule.
+    incident_detection_enabled: bool = True
+    incident_evaluation_interval_seconds: float = 15.0
+    # Consecutive healthy evaluations required before a breached incident is
+    # resolved. A small debounce prevents a single noisy window from flapping
+    # an incident closed and open again.
+    incident_recovery_evaluations: int = 2
+    # Availability incidents at or above this consumed-error-budget multiple are
+    # `critical`; below it they are `warning`. Default 1.0 means any breached
+    # availability SLO (whose budget is exhausted by construction) is critical.
+    incident_critical_budget_consumed: float = 1.0
+    # Maximum number of resolved incident records retained in memory.
+    incident_history_limit: int = 500
+    incidents_path: str = "/api/incidents"
+
     # API behaviour
     api_prefix: str = "/api"
     default_page_size: int = 20
@@ -129,7 +160,7 @@ class Settings(BaseSettings):
             raise ValueError(f"metrics_path must start with '/', got {value!r}")
         return path
 
-    @field_validator("failure_injection_path", "reliability_path")
+    @field_validator("failure_injection_path", "reliability_path", "incidents_path")
     @classmethod
     def _validate_admin_path(cls, value: str, info: ValidationInfo) -> str:
         path = value.strip()
@@ -177,6 +208,48 @@ class Settings(BaseSettings):
             raise ValueError(
                 "slo_window_seconds must be between 1 and "
                 f"{MAX_SLO_WINDOW_SECONDS}, got {value!r}"
+            )
+        return value
+
+    @field_validator("incident_evaluation_interval_seconds")
+    @classmethod
+    def _validate_incident_interval(cls, value: float) -> float:
+        if not 0.0 < value <= MAX_INCIDENT_EVAL_INTERVAL_SECONDS:
+            raise ValueError(
+                "incident_evaluation_interval_seconds must be greater than 0 and "
+                f"at most {MAX_INCIDENT_EVAL_INTERVAL_SECONDS}, got {value!r}"
+            )
+        return value
+
+    @field_validator("incident_recovery_evaluations")
+    @classmethod
+    def _validate_incident_recovery(cls, value: int) -> int:
+        if not 1 <= value <= MAX_INCIDENT_RECOVERY_EVALUATIONS:
+            raise ValueError(
+                "incident_recovery_evaluations must be between 1 and "
+                f"{MAX_INCIDENT_RECOVERY_EVALUATIONS}, got {value!r}"
+            )
+        return value
+
+    @field_validator("incident_critical_budget_consumed")
+    @classmethod
+    def _validate_incident_critical_budget(cls, value: float) -> float:
+        # A threshold below 1.0 would make even an un-exhausted budget critical,
+        # which contradicts the documented "exhausted => critical" rule.
+        if not 1.0 <= value <= MAX_INCIDENT_CRITICAL_BUDGET_CONSUMED:
+            raise ValueError(
+                "incident_critical_budget_consumed must be between 1.0 and "
+                f"{MAX_INCIDENT_CRITICAL_BUDGET_CONSUMED}, got {value!r}"
+            )
+        return value
+
+    @field_validator("incident_history_limit")
+    @classmethod
+    def _validate_incident_history(cls, value: int) -> int:
+        if not 1 <= value <= MAX_INCIDENT_HISTORY:
+            raise ValueError(
+                "incident_history_limit must be between 1 and "
+                f"{MAX_INCIDENT_HISTORY}, got {value!r}"
             )
         return value
 

@@ -4,17 +4,20 @@ An SRE/DevOps portfolio project. This repository is built in stages; the goal
 is to grow a small but realistic service into a fully instrumented, observable,
 and safely deployed system.
 
-**Current stage: reliability layer** — the Orders API runs as a Docker Compose
+**Current stage: incident detection** — the Orders API runs as a Docker Compose
 stack next to a Prometheus server that scrapes it, with a provisioned Grafana
-dashboard on top. On top of the existing instrumentation this stage adds
-**service-level indicators, objectives and an error budget**: the service
-measures its own availability and latency over a rolling window, compares them
-with configurable SLOs, exports the result as both a JSON API and Prometheus
-gauges, and visualises it in Grafana. It also keeps the earlier **controlled
-failure injection** — a flag-gated control API that adds artificial latency and
-HTTP 500s on demand — which is the easiest way to drive the reliability layer
-into a breach and back. Failure injection is disabled by default and refused in
-production. Alerting and deployment stages come later.
+dashboard on top. Building on the earlier **service-level indicators, objectives
+and error budget**, this stage adds an **automatic incident detection engine**: a
+supervised background detector evaluates the existing rolling reliability window
+on a timer and opens, updates and resolves incident records when configured
+rules fire. Incidents are exposed as a read-only JSON API (with a single
+acknowledge action), as low-cardinality Prometheus metrics, and on the Grafana
+dashboard. It also keeps the earlier **controlled failure injection** — a
+flag-gated control API that adds artificial latency and HTTP 500s on demand —
+which is the easiest way to drive the reliability layer into an incident and
+back. Failure injection is disabled by default and refused in production. The
+incident store is in memory only, so records are lost on restart. Notification
+and deployment stages come later.
 
 ## What this service is
 
@@ -37,6 +40,9 @@ be swapped in later without touching the HTTP layer.
 | `GET`  | `/api/orders`           | Paginated, filterable order list, newest first.                |
 | `GET`  | `/api/orders/{order_id}`| Full order detail including line items and money totals.       |
 | `GET`  | `/api/reliability`      | Rolling SLI/SLO evaluation and error budget as JSON.          |
+| `GET`  | `/api/incidents`        | Incident list with filters, paging and summary counts.        |
+| `GET`  | `/api/incidents/{id}`   | One incident, including its triggers and evidence.            |
+| `POST` | `/api/incidents/{id}/acknowledge` | Mark an incident acknowledged. Not a resolve.       |
 | `GET`  | `/metrics`              | Prometheus metrics, for scraping.                             |
 | `GET`  | `/admin/failure`        | Read failure-injection scenario. Only when enabled (see below). |
 | `PUT`  | `/admin/failure`        | Configure latency and/or HTTP 500 rate. Only when enabled.    |
@@ -676,9 +682,15 @@ a reliability section. The existing panels are unchanged.
 | Reliability Evaluation Status | `orders_api_slo_compliant` for both SLIs: `COMPLIANT`/`BREACHED`/`INSUFFICIENT DATA`. |
 | Reliability SLIs vs SLOs | time series of observed vs target for both SLIs. |
 | Error Budget: Remaining vs Consumed | `remaining_fraction` and `consumed_fraction` over time. |
+| Active Incidents | `orders_api_incidents_active` — how many incidents are currently open. |
+| Incident Detections by Type & Severity | `increase(orders_api_incident_detections_total[5m])` split by `type` and `severity`. |
+| Incident Resolutions by Type | `increase(orders_api_incident_resolutions_total[5m])` split by `type`. |
+| Incident API | a text panel with the `curl` commands to inspect incidents. |
 
 All reliability panels are configured with `INSUFFICIENT DATA` as their no-value,
-so an empty window shows a gap rather than a false 100% or green status.
+so an empty window shows a gap rather than a false 100% or green status. The
+incident panels are described in [Incident detection and
+lifecycle](#incident-detection-and-lifecycle).
 
 ### Demonstrating a breach (and recovering)
 
@@ -748,6 +760,197 @@ healthy requests.
 - The reliability endpoint is evaluated synchronously from an in-memory buffer,
   so its cost is proportional to the number of requests in the window.
 
+## Incident detection and lifecycle
+
+The reliability layer answers *how the service is doing right now*. The incident
+detector turns that continuous evaluation into **discrete, trackable incidents**:
+when a documented rule fires it opens an incident, while the rule keeps firing it
+updates it, and once the condition has genuinely recovered it resolves it.
+
+The detector is a **supervised background task** started and stopped with the
+application's lifespan. On each tick it reads the *same* rolling window the
+`/api/reliability` endpoint uses, so an incident can never disagree with the
+reliability report it was derived from. Incidents are exposed as a read-only
+JSON API (plus one acknowledge action), as low-cardinality Prometheus metrics,
+and as Grafana panels.
+
+### Detection rules
+
+| Rule | Incident type | Fires when |
+| ---- | ------------- | ---------- |
+| `availability_slo_breach` | `availability` | The availability SLI is `breached` (observed `<` target). |
+| `availability_error_budget_exhausted` | `availability` | The availability *error budget* is exhausted (`consumed >= 1.0`). |
+| `latency_slo_breach` | `latency` | The latency-compliance SLI is `breached` (observed `<` target). |
+
+The two availability rules are kept separate on purpose. They usually fire
+together — a breach almost always exhausts the budget — but they are not
+identical: at the exact boundary where the observed ratio *equals* the target,
+the SLI status is `at_risk` (not `breached`) yet the budget is already exhausted.
+Recording both rules means the incident evidence says *which* conditions were
+true, so a reader never has to reconstruct it. Having no rules fire is not the
+same as being healthy: `insufficient_data` fires nothing (see below).
+
+### Severity policy
+
+Severity is a function of *how far past* the objective the service is, not a
+guess:
+
+| Condition | Severity |
+| --------- | -------- |
+| Availability budget consumed `>=` `ORDERS_API_INCIDENT_CRITICAL_BUDGET_CONSUMED` (default `1.0`, i.e. exhausted) | `critical` |
+| Any other availability rule firing | `warning` |
+| Latency rule firing | `warning` |
+
+Both availability rules use the *same* computed severity, so an exhausted budget
+is `critical` whether it fired via the breach rule or the budget rule. When an
+incident has multiple firing rules, its severity is the **most severe** of them
+(`severity = max over firing rules`), so an incident never downgrades while it is
+still critical. The `critical` threshold is configurable: setting it to e.g.
+`2.0` means "only call it critical once twice the allowed budget is spent".
+
+### Lifecycle
+
+```
+                    rule fires
+   (no incident) ─────────────────▶  active        (creating: severity, triggers,
+                                       │             evidence captured)
+                     rules keep firing │
+                                       ▼
+                                     active        (updated_at bumped, extra
+                                       │             triggers merged in)
+                     rules cleared AND │ window healthy for N evals
+                                       ▼
+                                    resolved       (resolved_at set, duration
+                                                    recorded, one-way)
+```
+
+- **One active incident per type.** A second availability breach updates the
+  existing availability incident rather than opening a duplicate. Updating an
+  incident never changes its `detected_at`; only `updated_at` moves.
+- **Triggers accumulate.** If a latency incident is already open and the
+  availability rule later fires, that is a *different* type and therefore a
+  *new* incident — but if a second rule of the *same* type starts firing it is
+  merged into the open incident's trigger list (preserving the first time each
+  rule fired).
+- **Recovery is debounced.** A rule clearing for a single evaluation is not
+  enough: the incident resolves only after **N consecutive** healthy evaluations
+  (`ORDERS_API_INCIDENT_RECOVERY_EVALUATIONS`, default `2`). If any rule fires
+  again during that streak, the counter resets. This avoids flapping on a single
+  quiet tick.
+- **Insufficient data neither opens nor resolves.** If the window has no
+  eligible requests, no rule fires — but the recovery streak is *not* advanced
+  either, because "no traffic" is not evidence of health. An open incident stays
+  open until the service is actually serving requests again.
+- **Resolved is terminal.** A resolved incident is never reopened. A subsequent
+  breach of the same type creates a **new** incident with a new id, so the
+  history reads as a series of incidents rather than one record flickering.
+
+### Incident identity
+
+Each incident gets a sequential id (`INC-000001`, `INC-000002`, …). Ids are
+**not** used as metric labels — metrics are labelled by bounded `type` and
+`severity` only — so the id space cannot blow up Prometheus cardinality. Across a
+process restart ids restart from `INC-000001`, consistent with the store being in
+memory.
+
+### The incidents API
+
+```bash
+# List incidents, newest first. Filters: status, severity, type; paging: limit, offset.
+curl -s "http://localhost:8000/api/incidents" | python3 -m json.tool
+curl -s "http://localhost:8000/api/incidents?status=active&type=availability" | python3 -m json.tool
+
+# One incident, including every trigger that fired and the evidence at detection.
+curl -s "http://localhost:8000/api/incidents/INC-000001" | python3 -m json.tool
+
+# Acknowledge (does not resolve; a resolved incident cannot be acknowledged).
+curl -s -X POST "http://localhost:8000/api/incidents/INC-000001/acknowledge" | python3 -m json.tool
+```
+
+The list response carries summary `counts` (`total`, `active`, `resolved`) and a
+`pagination` block. Incidents are created and resolved **only** by the detector:
+there is no create or delete endpoint. Acknowledging an incident is an
+operational annotation (`acknowledged: true`, `acknowledged_at` set) — it does
+not suppress detection or change the incident's status. Acknowledging an already
+resolved incident returns `409` with `error.code: incident_resolved`; an unknown
+id returns `404` with `error.code: incident_not_found`.
+
+### Incident metrics
+
+| Metric | Type | Labels | Meaning |
+| ------ | ---- | ------ | ------- |
+| `orders_api_incidents_active` | gauge | none | Incidents currently open. Refreshed on scrape and on every detector transition. |
+| `orders_api_incident_detections_total` | counter | `type`, `severity` | Incidents opened. Incremented once, at detection. |
+| `orders_api_incident_resolutions_total` | counter | `type` | Incidents resolved. Incremented once, at resolution. |
+| `orders_api_incident_duration_seconds` | histogram | `type` | Seconds from `detected_at` to `resolved_at`, observed at resolution. |
+
+Counters move only on the **transition**, not on every evaluation: an incident
+that stays open across ten ticks still counts as one detection. Grafana therefore
+reads detection/resolution panels as `increase(...[5m])` rates, and the active
+gauge as an instantaneous level.
+
+### Demonstrating an incident (and recovering)
+
+This is the end-to-end demo: drive a real breach with failure injection, watch
+the detector open an incident automatically, then let it recover. The detector's
+default interval is 15 s and recovery needs 2 healthy evaluations, so allow up
+to a minute or so at each step.
+
+```bash
+# 1. Inject 100% HTTP 500s on application requests.
+curl -s -X PUT http://localhost:8000/admin/failure \
+  -H 'content-type: application/json' \
+  -d '{"enabled": true, "failure_rate_percent": 100}'
+
+# 2. Send a burst of failing requests (enough to breach the availability SLO).
+for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:8000/api/orders; done
+
+# 3. Wait for the detector to tick, then look at the incident list.
+sleep 20
+curl -s "http://localhost:8000/api/incidents" | python3 -m json.tool
+#   "counts": { "active": 1, ... }
+#   the incident's "type": "availability", "severity": "critical",
+#   "status": "active", with triggers for the breach and the budget exhaustion.
+
+# 4. Restore normal behaviour.
+curl -s -X DELETE http://localhost:8000/admin/failure
+
+# 5. Send healthy traffic so the rolling window refills, then wait for recovery.
+for i in $(seq 1 60); do curl -s -o /dev/null http://localhost:8000/api/orders; done
+sleep 40
+curl -s "http://localhost:8000/api/incidents?status=resolved" | python3 -m json.tool
+#   the incident is "resolved" with resolved_at and a duration recorded.
+```
+
+In Grafana, watch **Active Incidents** rise from 0 to 1, the **Incident
+Detections** panel gain an `availability / critical` series, and then **Incident
+Resolutions** gain an `availability` series as the window recovers. In
+Prometheus, `orders_api_incidents_active` is the quickest check:
+
+```promql
+orders_api_incidents_active
+sum by (type, severity) (increase(orders_api_incident_detections_total[10m]))
+orders_api_incident_duration_seconds_count
+```
+
+### Notes and limitations
+
+- **In-memory only.** Incidents live in the API process. Restarting the API
+  loses all open and historical incidents, and ids restart at `INC-000001`.
+  This is deliberate for this stage; durable incident storage (and the
+  notification stage) comes later. Open incidents are *not* reconstructed from
+  Prometheus counters after a restart.
+- **Single instance.** There is no cross-instance aggregation or leader
+  election. With multiple replicas each instance detects independently from its
+  own traffic view, exactly as it reports its own SLIs.
+- **History is bounded.** At most `ORDERS_API_INCIDENT_HISTORY_LIMIT` resolved
+  incidents are retained (oldest resolved records are evicted first). Active
+  incidents are never evicted.
+- **Failure injection is refused in production**, so the demo above is a local
+  activity by construction.
+- The detector *inherits* every limitation of the reliability layer — it adds no
+  traffic, storage or sampling of its own.
+
 ## Configuration
 
 All settings are read from environment variables, falling back to `.env` and
@@ -777,6 +980,12 @@ then to the defaults below. Every variable is prefixed with `ORDERS_API_`.
 | `ORDERS_API_SLO_WINDOW_SECONDS` | `300` | Rolling observation window in seconds. |
 | `ORDERS_API_SLO_AT_RISK_BUDGET_REMAINING` | `0.25` | Flag an SLO `at_risk` once its remaining budget is at or below this fraction. |
 | `ORDERS_API_RELIABILITY_PATH` | `/api/reliability` | Reliability evaluation endpoint path. |
+| `ORDERS_API_INCIDENT_DETECTION_ENABLED` | `true` | Start the background incident detector. |
+| `ORDERS_API_INCIDENT_EVALUATION_INTERVAL_SECONDS` | `15` | Seconds between detector evaluations. |
+| `ORDERS_API_INCIDENT_RECOVERY_EVALUATIONS` | `2` | Consecutive healthy evaluations required before an incident resolves. |
+| `ORDERS_API_INCIDENT_CRITICAL_BUDGET_CONSUMED` | `1.0` | Consumed-budget multiple at or above which an availability incident is `critical`. |
+| `ORDERS_API_INCIDENT_HISTORY_LIMIT` | `500` | Maximum resolved incidents retained in memory. |
+| `ORDERS_API_INCIDENTS_PATH` | `/api/incidents` | Incidents API path. |
 
 Invalid values fail fast at start-up rather than at the first request. Enabling
 failure injection in a production environment is one such invalid value: the
@@ -808,6 +1017,18 @@ curl -s http://localhost:8000/api/orders/ORD-9999-9999
 
 # Trace a request end to end using your own correlation id
 curl -s -H "x-request-id: my-trace-id" http://localhost:8000/api/orders
+
+# Reliability evaluation (SLIs, SLOs, error budget)
+curl -s http://localhost:8000/api/reliability
+
+# Incidents opened by the detector (newest first, with counts and paging)
+curl -s "http://localhost:8000/api/incidents?status=active"
+
+# One incident, with its triggers and evidence
+curl -s http://localhost:8000/api/incidents/INC-000001
+
+# Acknowledge an incident (does not resolve it)
+curl -s -X POST http://localhost:8000/api/incidents/INC-000001/acknowledge
 
 # Prometheus metrics
 curl -s http://localhost:8000/metrics
@@ -988,6 +1209,16 @@ immediately from `orders_api_order_lookups_total{outcome="not_found"}`.
 | `orders_api_error_budget_remaining_fraction` | Gauge | `slo`            | Budget remaining, floored at `0.0`.                    |
 | `orders_api_error_budget_exhausted`     | Gauge     | `slo`              | `1` when the budget is exhausted, else `0`.            |
 
+**Incident metrics** (see [Incident detection and
+lifecycle](#incident-detection-and-lifecycle))
+
+| Metric                                  | Type      | Labels             | What it answers                                        |
+| --------------------------------------- | --------- | ------------------ | ------------------------------------------------------ |
+| `orders_api_incidents_active`           | Gauge     | —                  | Incidents currently open.                              |
+| `orders_api_incident_detections_total`  | Counter   | `type`, `severity` | Incidents opened, by bounded type and severity.        |
+| `orders_api_incident_resolutions_total` | Counter   | `type`             | Incidents resolved, by type.                           |
+| `orders_api_incident_duration_seconds`  | Histogram | `type`             | Time from detection to resolution, per incident.       |
+
 Example output after a few requests:
 
 ```
@@ -1084,25 +1315,28 @@ app/
   models.py          request/response schemas and money rules
   repository.py      order data access
   seed.py            in-memory fixture data
-  routers/
-    health.py        /health and /ready
-    orders.py        /api/orders endpoints
-    reliability.py   /api/reliability SLI/SLO evaluation
-    metrics.py       /metrics scrape endpoint
-    failure.py       /admin/failure control API (demo only)
-run.py               entrypoint, binds using environment config
-tests/               pytest suite
+   routers/
+     health.py        /health and /ready
+     orders.py        /api/orders endpoints
+     reliability.py   /api/reliability SLI/SLO evaluation
+     incidents.py     /api/incidents and incident state
+     metrics.py       /metrics scrape endpoint
+     failure.py       /admin/failure control API (demo only)
+ run.py               entrypoint, binds using environment config
+ tests/               pytest suite
 ```
 
 ## Not in this stage
 
-Deliberately deferred to later stages: Alertmanager, Kubernetes, Terraform,
-AWS, CI/CD, a database, and authentication.
+Deliberately deferred to later stages: durable incident storage/notifications,
+Alertmanager, Kubernetes, Terraform, AWS, CI/CD, a database, and
+authentication.
 
 Prometheus collects and stores the metrics locally and Grafana visualises
-them. The reliability layer now computes SLIs against SLOs and derives an error
-budget, but nothing **alerts** on top of that data yet — Alertmanager is a later
-milestone. The dashboard is provisioned from git, so the whole stack can be
+them. The reliability layer now computes SLIs against SLOs, derives an error
+budget, and detects and manages incidents, but nothing **alerts or notifies** on
+top of that data yet — Alertmanager and incident notifications are later
+milestones. The dashboard is provisioned from git, so the whole stack can be
 recreated on a fresh machine with a single `docker compose up`.
 
 Failure injection here is a deliberately small, flag-gated demo tool. It is not

@@ -53,6 +53,33 @@ METRIC_NAMESPACE = "orders_api"
 #: exploding cardinality.
 UNMATCHED_ROUTE = "unmatched"
 
+#: Incident label vocabularies. Incident *ids* are never labels: they are
+#: unbounded, so only the bounded type/severity dimensions are exported.
+INCIDENT_TYPE_AVAILABILITY = "availability"
+INCIDENT_TYPE_LATENCY = "latency"
+INCIDENT_TYPE_VALUES = (INCIDENT_TYPE_AVAILABILITY, INCIDENT_TYPE_LATENCY)
+INCIDENT_SEVERITY_WARNING = "warning"
+INCIDENT_SEVERITY_CRITICAL = "critical"
+INCIDENT_SEVERITY_VALUES = (INCIDENT_SEVERITY_WARNING, INCIDENT_SEVERITY_CRITICAL)
+UNKNOWN_INCIDENT_TYPE = "unknown"
+UNKNOWN_INCIDENT_SEVERITY = "unknown"
+
+#: Incident durations run from seconds to hours, so the buckets span that range.
+INCIDENT_DURATION_BUCKETS = (
+    1.0,
+    5.0,
+    15.0,
+    30.0,
+    60.0,
+    120.0,
+    300.0,
+    600.0,
+    1800.0,
+    3600.0,
+    7200.0,
+    86400.0,
+)
+
 #: Buckets are in seconds. Chosen around the latency range a read-only JSON API
 #: should sit in, so a regression shows up as a p95/p99 shift rather than
 #: hiding in the +Inf bucket.
@@ -97,6 +124,14 @@ def _normalise_filter(status_filter: str | None, allowed: Iterable[str]) -> str:
     if not status_filter:
         return NO_FILTER
     return status_filter if status_filter in set(allowed) else OTHER_FILTER
+
+
+def _normalise_incident_type(incident_type: str) -> str:
+    return incident_type if incident_type in INCIDENT_TYPE_VALUES else UNKNOWN_INCIDENT_TYPE
+
+
+def _normalise_incident_severity(severity: str) -> str:
+    return severity if severity in INCIDENT_SEVERITY_VALUES else UNKNOWN_INCIDENT_SEVERITY
 
 
 _PATH_PARAM = re.compile(r"\{([^{}:]+)(?::([^{}]+))?\}")
@@ -256,12 +291,41 @@ class Metrics:
             registry=self.registry,
         )
 
+        # --- incidents -----------------------------------------------------
+        # Low-cardinality only: incident ids, timestamps and other unbounded
+        # values are deliberately absent.
+        self.incidents_active = Gauge(
+            f"{METRIC_NAMESPACE}_incidents_active",
+            "Number of incidents that are not yet resolved.",
+            registry=self.registry,
+        )
+        self.incident_detections_total = Counter(
+            f"{METRIC_NAMESPACE}_incident_detections_total",
+            "Incidents opened by the detector, by incident type and severity.",
+            ["type", "severity"],
+            registry=self.registry,
+        )
+        self.incident_resolutions_total = Counter(
+            f"{METRIC_NAMESPACE}_incident_resolutions_total",
+            "Incidents resolved, by incident type.",
+            ["type"],
+            registry=self.registry,
+        )
+        self.incident_duration_seconds = Histogram(
+            f"{METRIC_NAMESPACE}_incident_duration_seconds",
+            "Time from detection to resolution for resolved incidents, by type.",
+            ["type"],
+            buckets=INCIDENT_DURATION_BUCKETS,
+            registry=self.registry,
+        )
+
         # Version and environment are constant per deployment, so this is one
         # bounded series rather than a per-request label.
         self.build_info.labels(
             version=settings.app_version, environment=settings.environment
         ).set(1)
         self.ready.set(0)
+        self.incidents_active.set(0)
 
         # Targets are known at construction, so they are exported immediately;
         # observed/budget values wait for real observations and read as NaN
@@ -371,6 +435,27 @@ class Metrics:
     @staticmethod
     def _set_optional(gauge: Gauge, name: str, value: float | None) -> None:
         gauge.labels(slo=name).set(_NAN if value is None else value)
+
+    # --- incidents ---------------------------------------------------------
+
+    def record_incident_detection(self, incident_type: str, severity: str) -> None:
+        """Count one newly opened incident."""
+        self.incident_detections_total.labels(
+            type=_normalise_incident_type(incident_type),
+            severity=_normalise_incident_severity(severity),
+        ).inc()
+
+    def record_incident_resolution(self, incident_type: str, duration_seconds: float) -> None:
+        """Count and time one resolved incident."""
+        safe_type = _normalise_incident_type(incident_type)
+        self.incident_resolutions_total.labels(type=safe_type).inc()
+        self.incident_duration_seconds.labels(type=safe_type).observe(
+            max(0.0, float(duration_seconds))
+        )
+
+    def set_active_incidents(self, count: int) -> None:
+        """Publish the current number of unresolved incidents."""
+        self.incidents_active.set(max(0, int(count)))
 
     # --- exposition --------------------------------------------------------
 

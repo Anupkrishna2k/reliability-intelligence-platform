@@ -38,6 +38,12 @@ def build_router(path: str = DEFAULT_METRICS_PATH) -> APIRouter:
             )
             application_metrics.update_reliability(snapshot)
 
+        # Keep the active-incident count current even if the detector is
+        # disabled, so the gauge always agrees with the incident API.
+        store = getattr(request.app.state, "incidents", None)
+        if store is not None:
+            application_metrics.set_active_incidents(store.active_count())
+
         payload, content_type = application_metrics.render()
         return Response(content=payload, media_type=content_type)
 

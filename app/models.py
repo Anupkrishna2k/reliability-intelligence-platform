@@ -328,6 +328,129 @@ class ReliabilityResponse(BaseModel):
     notes: list[str]
 
 
+# --- incidents ---------------------------------------------------------------
+# An incident is a lifecycle record opened by the detector when a reliability
+# rule fires, updated while it keeps firing, and resolved when the rule has been
+# clear for a documented number of consecutive evaluations. Incidents are held
+# in process memory only: they are lost on restart and easy to move to a store.
+
+
+class IncidentType(str, Enum):
+    """Coarse incident identity. At most one active incident per type."""
+
+    AVAILABILITY = "availability"
+    LATENCY = "latency"
+
+
+class IncidentSeverity(str, Enum):
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+class IncidentStatus(str, Enum):
+    OPEN = "open"
+    ACKNOWLEDGED = "acknowledged"
+    RESOLVED = "resolved"
+
+
+#: The detection rules that can contribute a trigger to an incident. Kept as
+#: plain strings so they survive JSON round-trips and read clearly in evidence.
+RULE_AVAILABILITY_BREACH = "availability_slo_breach"
+RULE_AVAILABILITY_BUDGET_EXHAUSTED = "availability_error_budget_exhausted"
+RULE_LATENCY_BREACH = "latency_slo_breach"
+
+
+class IncidentTrigger(BaseModel):
+    """One rule that is currently firing on an incident."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule: str = Field(description="Detection rule id, e.g. 'availability_slo_breach'.")
+    severity: IncidentSeverity
+    detected_at: datetime = Field(
+        description="When this rule first fired on the incident."
+    )
+
+
+class IncidentEvidence(BaseModel):
+    """Bounded, structured evidence captured from the reliability evaluation.
+
+    Only aggregate numbers from the rolling window are kept - never logs, request
+    payloads or identifiers - so the record is cheap to store and safe to expose.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    observed_at: datetime = Field(description="When this evidence was captured.")
+    window_seconds: int = Field(ge=1, description="Rolling observation window.")
+    eligible_requests: int = Field(ge=0)
+    failed_requests: int = Field(ge=0)
+    observed_availability: float | None = Field(default=None, ge=0, le=1)
+    availability_target: float = Field(gt=0, lt=1)
+    observed_latency: float | None = Field(default=None, ge=0, le=1)
+    latency_target: float = Field(gt=0, lt=1)
+    latency_threshold_ms: float = Field(gt=0)
+    error_budget_consumed: float | None = Field(
+        default=None, ge=0, description="Consumed availability budget; may exceed 1.0."
+    )
+    error_budget_exhausted: bool
+    summary: str = Field(description="Short human-readable summary of the evidence.")
+
+
+class Incident(BaseModel):
+    """A detected reliability incident and its lifecycle state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: str
+    type: IncidentType
+    severity: IncidentSeverity
+    status: IncidentStatus
+    detected_at: datetime = Field(description="First time the incident was detected.")
+    updated_at: datetime = Field(description="Last time the incident was updated.")
+    triggers: list[IncidentTrigger] = Field(
+        description="Rules currently firing, with the time each started."
+    )
+    evidence: IncidentEvidence
+    detection_count: int = Field(
+        ge=1, description="Number of evaluations that found the incident active."
+    )
+    acknowledged_at: datetime | None = None
+    resolved_at: datetime | None = None
+    duration_seconds: float | None = Field(
+        default=None, ge=0, description="detected_at to resolved_at, when resolved."
+    )
+
+
+class IncidentCounts(BaseModel):
+    """Summary counts across all retained incidents."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    total: int = Field(ge=0)
+    active: int = Field(ge=0, description="Incidents that are not resolved.")
+    by_status: dict[str, int]
+    by_severity: dict[str, int]
+
+
+class IncidentPagination(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+    returned: int = Field(ge=0)
+    has_more: bool
+
+
+class IncidentListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    incidents: list[Incident]
+    pagination: IncidentPagination
+    counts: IncidentCounts
+
+
 class ErrorBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -22,6 +22,14 @@ class OrderNotFoundError(Exception):
         super().__init__(f"order {order_id!r} was not found")
 
 
+class IncidentNotFoundError(Exception):
+    """Raised when an incident id does not exist in the store."""
+
+    def __init__(self, incident_id: str) -> None:
+        self.incident_id = incident_id
+        super().__init__(f"incident {incident_id!r} was not found")
+
+
 def _envelope(
     code: str,
     message: str,
@@ -44,6 +52,20 @@ async def order_not_found_handler(
             f"Order '{exc.order_id}' does not exist.",
             get_request_id(),
             {"order_id": exc.order_id},
+        ),
+    )
+
+
+async def incident_not_found_handler(
+    request: Request, exc: IncidentNotFoundError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content=_envelope(
+            "incident_not_found",
+            f"Incident '{exc.incident_id}' does not exist.",
+            get_request_id(),
+            {"incident_id": exc.incident_id},
         ),
     )
 

@@ -64,10 +64,23 @@ class RequestContextMiddleware:
             # The failure-injection control plane is operational tooling, not
             # application traffic, so it is excluded just like the metrics path.
             self._excluded.add(settings.failure_injection_path)
+        # The incident API is operational tooling too, and its detail paths
+        # carry an id, so it is excluded by prefix rather than by exact path.
+        self._excluded_prefixes = (settings.incidents_path,)
+
+    def _is_excluded_prefix(self, path: str) -> bool:
+        return any(
+            path == prefix or path.startswith(prefix + "/")
+            for prefix in self._excluded_prefixes
+        )
 
     def _should_record(self, path: str) -> bool:
         """Decide whether this path counts as application traffic."""
         if not self.settings.metrics_enabled:
+            return False
+        # Administrative incident routes are never application traffic, even
+        # when probes are deliberately included.
+        if self._is_excluded_prefix(path):
             return False
         if self.settings.metrics_include_probes:
             return True
@@ -189,6 +202,18 @@ class FailureInjectionMiddleware:
             # injection instead of the service.
             settings.reliability_path,
         }
+        # The incident API must stay reachable while failures are being
+        # injected, otherwise an operator could not inspect the incidents that
+        # the injection just caused.
+        self._exempt_prefixes = (settings.incidents_path,)
+
+    def _is_exempt(self, path: str) -> bool:
+        if path in self._exempt:
+            return True
+        return any(
+            path == prefix or path.startswith(prefix + "/")
+            for prefix in self._exempt_prefixes
+        )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or not self.injector.feature_enabled:
@@ -196,7 +221,7 @@ class FailureInjectionMiddleware:
             return
 
         path = scope.get("path", "/")
-        if path in self._exempt:
+        if self._is_exempt(path):
             await self.app(scope, receive, send)
             return
 
